@@ -227,7 +227,7 @@ _HTML = """<!DOCTYPE html>
       </div>
     </div>
     <div style="margin-top:1rem;display:flex;align-items:center;gap:0.6rem;">
-      <input type="checkbox" id="inp-harmonize" checked
+      <input type="checkbox" id="inp-harmonize"
              style="width:16px;height:16px;accent-color:#7c3aed;cursor:pointer;"/>
       <label for="inp-harmonize" style="font-size:0.85rem;color:#e2e8f0;cursor:pointer;">
         Color Harmonization

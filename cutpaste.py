@@ -116,35 +116,41 @@ def _lab_to_rgb(lab):
     return np.clip(rgb, 0.0, 1.0)
 
 
-def _reinhard_transfer(person_arr, background_arr, person_mask):
+def _reinhard_transfer(composite_arr, canvas_mask, strength=0.35):
     """
-    Adjust person colors so its L*a*b* statistics match the background.
+    Gently shift the person's L*a*b* mean toward the background's mean.
 
-    person_arr, background_arr: float32 RGB [0,255]
-    person_mask: float32 [0,1] on the canvas (same H×W as the arrays)
-    Returns adjusted person_arr (float32 RGB [0,255]).
+    composite_arr: float32 RGB [0,255] — full composited canvas
+    canvas_mask:   float32 [0,1]       — person mask on canvas
+    strength:      0.0 = no effect, 1.0 = full transfer (default 0.35)
+
+    Only the mean is transferred (no std scaling) to prevent color collapse
+    when the background is near-uniform.
     """
-    p = person_arr / 255.0
-    bg = background_arr / 255.0
+    img = composite_arr / 255.0
+    lab = _rgb_to_lab(img)
 
-    p_lab  = _rgb_to_lab(p)
-    bg_lab = _rgb_to_lab(bg)
+    fg = canvas_mask > 0.5   # solid person pixels
+    bg = canvas_mask < 0.1   # solid background pixels
 
-    fg_pixels = person_mask > 0.5                      # boolean mask
-    bg_pixels = person_mask < 0.1
+    if fg.sum() < 100 or bg.sum() < 100:
+        return composite_arr  # not enough pixels to sample — skip
 
-    result_lab = p_lab.copy()
+    result_lab = lab.copy()
     for ch in range(3):
-        src = p_lab[..., ch][fg_pixels]
-        tgt = bg_lab[..., ch][bg_pixels]
-        if src.std() < 1e-6 or tgt.std() < 1e-6:
-            continue
-        # shift person channel to match background mean/std
-        adjusted = (src - src.mean()) * (tgt.std() / src.std()) + tgt.mean()
-        result_lab[..., ch][fg_pixels] = adjusted
+        src_vals = lab[..., ch][fg]
+        tgt_vals = lab[..., ch][bg]
+
+        # Only shift the mean — do NOT scale by std ratio.
+        # Scaling by tgt.std/src.std washes out the person when
+        # the background is near-uniform (tgt.std ≈ 0).
+        mean_shift = tgt_vals.mean() - src_vals.mean()
+
+        # Blend: don't fully drag person to background, just nudge it
+        result_lab[..., ch][fg] = src_vals + mean_shift * strength
 
     result_rgb = _lab_to_rgb(result_lab)
-    return (result_rgb * 255.0).astype(np.float32)
+    return np.clip(result_rgb * 255.0, 0, 255).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +165,7 @@ def replace_background(
     confidence_threshold=0.5,
     feather_sigma=3.0,
     person_fill=0.75,
-    harmonize=True,
+    harmonize=False,
     device="cuda",
 ):
     """
@@ -226,7 +232,7 @@ def replace_background(
 
     # Reinhard color harmonization
     if harmonize:
-        result_arr = _reinhard_transfer(result_arr, result_arr.copy(), canvas_mask)
+        result_arr = _reinhard_transfer(result_arr, canvas_mask)
 
     Image.fromarray(result_arr.astype(np.uint8)).save(output_path)
     label = "harmonized" if harmonize else "composited"
