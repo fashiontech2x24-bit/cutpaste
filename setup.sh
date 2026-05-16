@@ -28,10 +28,9 @@ echo "Installing ML dependencies..."
 pip install "transformers>=5.0" huggingface_hub scipy pillow
 
 echo "Installing harmonization (libcom / PCTNet)..."
-# Install libcom without its heavy optional deps (mmpose, mmdet) which have
-# broken build scripts (chumpy, xtcocotools). We only use ImageHarmonizationModel
-# (PCTNet) which only needs the packages listed below.
-pip install libcom --no-deps
+# PyPI libcom is missing source/src model code — must install from GitHub.
+# --no-deps skips mmpose/mmdet which have broken build scripts (chumpy, xtcocotools).
+pip install "git+https://github.com/bcmi/libcom.git" --no-deps
 pip install lpips timm einops diffusers==0.34.0 opencv-python
 
 echo "Installing server dependencies..."
