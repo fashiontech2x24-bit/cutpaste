@@ -33,7 +33,7 @@ echo "Installing harmonization (libcom / PCTNet)..."
 # --no-deps skips mmpose/mmdet which have broken build scripts.
 git clone --recurse-submodules https://github.com/bcmi/libcom.git /tmp/libcom_src
 pip install -e /tmp/libcom_src --no-deps
-pip install lpips timm einops diffusers==0.34.0 opencv-python
+pip install lpips timm einops diffusers==0.34.0 opencv-python pytorch-lightning omegaconf kornia
 
 echo "Installing server dependencies..."
 pip install fastapi uvicorn[standard] python-multipart
