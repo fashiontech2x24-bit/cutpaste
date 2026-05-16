@@ -185,13 +185,12 @@ def _lab_to_rgb(lab):
     return np.clip(rgb, 0.0, 1.0)
 
 
-def _ambient_light_match(composite_arr, canvas_mask, strength=0.45):
+def _ambient_light_match(composite_arr, canvas_mask, strength=0.55):
     """
-    Shift the person's Lab values toward the background scene.
-    - a* / b*: full strength  → color temperature / hue match
-    - L*     : half strength  → gentle brightness match so neutral/gray
-                                backgrounds (zero chroma difference) still
-                                produce a visible lighting adjustment.
+    Match person's Lab mean AND standard deviation to the background.
+    Mean shift → exposure / color temperature.
+    Std-ratio  → contrast match (e.g. moody dark bg tightens the person's tones).
+    std_ratio is clamped to [0.6, 1.8] to prevent collapse on uniform backgrounds.
     """
     img = composite_arr / 255.0
     lab = _rgb_to_lab(img)
@@ -203,14 +202,19 @@ def _ambient_light_match(composite_arr, canvas_mask, strength=0.45):
         return composite_arr
 
     result_lab = lab.copy()
-    strengths = [strength * 0.5, strength, strength]   # L*, a*, b*
     for ch in range(3):
-        bg_mean = lab[..., ch][bg].mean()
-        fg_mean = lab[..., ch][fg].mean()
-        shift   = (bg_mean - fg_mean) * strengths[ch]
+        src = lab[..., ch][fg]
+        tgt = lab[..., ch][bg]
+        src_mean, src_std = src.mean(), src.std() + 1e-8
+        tgt_mean, tgt_std = tgt.mean(), tgt.std() + 1e-8
+        std_ratio = np.clip(tgt_std / src_std, 0.6, 1.8)
+
+        # Full Reinhard transfer for this pixel: (x-src_mean)*std_ratio + tgt_mean
+        transferred = (lab[..., ch] - src_mean) * std_ratio + tgt_mean
+        blend = canvas_mask * strength
         result_lab[..., ch] = np.where(
             canvas_mask > 0.05,
-            lab[..., ch] + shift * canvas_mask,
+            lab[..., ch] * (1 - blend) + transferred * blend,
             lab[..., ch],
         )
 
@@ -266,13 +270,13 @@ def replace_background(
     confidence_threshold=0.5,
     erode_px=4,
     feather_sigma=3.0,
-    person_fill=0.90,
-    foot_anchor=0.90,
+    person_fill=0.92,
+    foot_anchor=0.92,
     shadow=True,
     shadow_strength=0.55,
     harmonize=False,
     ambient_light=True,
-    ambient_strength=0.45,
+    ambient_strength=0.55,
     device="cuda",
 ):
     """
@@ -320,13 +324,21 @@ def replace_background(
     px0 = max(foot_x - 30, 0);  px1 = min(foot_x + 30, OUTPUT_W)
     ground_depth = float(bg_depth[py0:py1, px0:px1].mean())  # 0=far, 1=close
 
-    # --- Scale: height-driven only so person_fill is always honoured ---
-    # The old min(width, height) let wide portraits be constrained by width,
-    # making the person far shorter than person_fill requested.
-    # We now scale by height exclusively; if the result is wider than the canvas
-    # the sides are symmetrically clipped (person body stays centred).
+    # --- Scale by mask bounding box, not portrait bounding box ---
+    # Portrait images often have blank space above the head and below the feet.
+    # Scaling by portrait height means person_fill=0.90 only fills ~65-70% of the
+    # frame once background padding is accounted for.  Use the mask's bounding box
+    # so person_fill always reflects the actual person body height in the output.
     p_w, p_h  = portrait.size
-    fit_scale = OUTPUT_H * person_fill / p_h
+    mask_rows_orig = np.any(mask > 0.5, axis=1)
+    if mask_rows_orig.any():
+        mb_top_orig = int(np.where(mask_rows_orig)[0][0])
+        mb_bot_orig = int(np.where(mask_rows_orig)[0][-1])
+    else:
+        mb_top_orig, mb_bot_orig = 0, p_h - 1
+    person_body_h = mb_bot_orig - mb_top_orig + 1
+
+    fit_scale = OUTPUT_H * person_fill / person_body_h
     new_w     = int(p_w * fit_scale)
     new_h     = int(p_h * fit_scale)
 
@@ -335,10 +347,13 @@ def replace_background(
         Image.fromarray((mask * 255).astype(np.uint8)).resize((new_w, new_h), Image.LANCZOS)
     ).astype(np.float32) / 255.0
 
+    # Scaled positions of mask top/bottom in the resized portrait
+    mb_bot_scaled = int(mb_bot_orig * fit_scale)
+
     # --- Foot-anchored placement ---
-    # Centre horizontally; clip if new_w > OUTPUT_W (wide portraits).
+    # Feet (mask bottom) land at foot_y; wide portraits clip at canvas edges.
     x_off = (OUTPUT_W - new_w) // 2        # negative when person wider than canvas
-    y_off = max(foot_y - new_h, 0)         # clamp so head never goes above frame top
+    y_off = max(foot_y - mb_bot_scaled, 0) # anchor feet, clamp head above frame
 
     # Canvas & person slice coordinates (handle wide-portrait clipping)
     xc0 = max(x_off, 0);          xc1 = min(x_off + new_w, OUTPUT_W)
