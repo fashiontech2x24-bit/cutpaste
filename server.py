@@ -403,6 +403,8 @@ async def process(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
         except Exception as exc:
+            import traceback
+            traceback.print_exc()
             raise HTTPException(status_code=500, detail=f"Inference error: {exc}")
         finally:
             portrait_path.unlink(missing_ok=True)
