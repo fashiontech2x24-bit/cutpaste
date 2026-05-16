@@ -28,10 +28,11 @@ echo "Installing ML dependencies..."
 pip install "transformers>=5.0" huggingface_hub scipy pillow
 
 echo "Installing harmonization (libcom / PCTNet)..."
-# chumpy (mmpose dep) is abandoned and tries to import pip internally.
-# --no-build-isolation makes setuptools use the environment's pip instead.
-pip install chumpy --no-build-isolation
-pip install libcom
+# Install libcom without its heavy optional deps (mmpose, mmdet) which have
+# broken build scripts (chumpy, xtcocotools). We only use ImageHarmonizationModel
+# (PCTNet) which only needs the packages listed below.
+pip install libcom --no-deps
+pip install lpips timm einops diffusers==0.34.0 opencv-python
 
 echo "Installing server dependencies..."
 pip install fastapi uvicorn[standard] python-multipart
