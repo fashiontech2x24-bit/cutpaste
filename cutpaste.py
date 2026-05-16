@@ -185,7 +185,7 @@ def _lab_to_rgb(lab):
     return np.clip(rgb, 0.0, 1.0)
 
 
-def _ambient_light_match(composite_arr, canvas_mask, strength=0.55):
+def _ambient_light_match(composite_arr, canvas_mask, strength=0.30):
     """
     Match person's Lab mean AND standard deviation to the background.
     Mean shift → exposure / color temperature.
@@ -276,7 +276,7 @@ def replace_background(
     shadow_strength=0.55,
     harmonize=False,
     ambient_light=True,
-    ambient_strength=0.55,
+    ambient_strength=0.30,
     device="cuda",
 ):
     """

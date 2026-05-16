@@ -222,6 +222,10 @@ _HTML = """<!DOCTYPE html>
         <input type="number" id="inp-shadow-str" value="0.55" min="0.0" max="1.0" step="0.05"/>
       </div>
       <div>
+        <label class="field-label" for="inp-ambient-str">Light Match Strength</label>
+        <input type="number" id="inp-ambient-str" value="0.30" min="0.0" max="1.0" step="0.05"/>
+      </div>
+      <div>
         <label class="field-label" for="inp-prompt">Segmentation Prompt</label>
         <input type="text" id="inp-prompt" value="person" placeholder="person"/>
       </div>
@@ -350,7 +354,8 @@ _HTML = """<!DOCTYPE html>
     form.append('foot_anchor',     document.getElementById('inp-foot').value / 100);
     form.append('shadow',          document.getElementById('inp-shadow').checked ? '1' : '0');
     form.append('shadow_strength', document.getElementById('inp-shadow-str').value);
-    form.append('ambient_light',   document.getElementById('inp-ambient').checked ? '1' : '0');
+    form.append('ambient_light',    document.getElementById('inp-ambient').checked ? '1' : '0');
+    form.append('ambient_strength', document.getElementById('inp-ambient-str').value);
     form.append('harmonize',       document.getElementById('inp-harmonize').checked ? '1' : '0');
 
     try {
