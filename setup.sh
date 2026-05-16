@@ -19,29 +19,13 @@ pip install \
     "uvicorn[standard]" \
     python-multipart
 
-echo "[3/5] Installing MODNet..."
-MODNET_DIR="${MODNET_REPO:-/workspace/MODNet}"
-if [ ! -d "$MODNET_DIR" ]; then
-    git clone https://github.com/ZHKKKe/MODNet "$MODNET_DIR"
-else
-    echo "  MODNet repo already exists at $MODNET_DIR"
-fi
+echo "[3/5] Installing rembg (portrait matting, auto-downloads model)..."
+pip install "rembg[gpu]"
 
-CKPT="$MODNET_DIR/modnet_photographic_portrait_matting.ckpt"
-if [ ! -f "$CKPT" ]; then
-    echo "  Downloading MODNet weights..."
-    pip install -q gdown
-    python - <<'PYEOF'
-import gdown, os
-out = os.path.join(os.environ.get("MODNET_REPO", "/workspace/MODNet"),
-                   "modnet_photographic_portrait_matting.ckpt")
-gdown.download(id="1Nf1ZxeJZJL8Qx9KadcYYyEmmlKwHHqNk", output=out, quiet=False)
-PYEOF
-else
-    echo "  MODNet weights already present."
-fi
+echo "[4/5] Pre-downloading rembg u2net_human_seg model (~170MB from GitHub)..."
+python -c "from rembg import new_session; new_session('u2net_human_seg'); print('rembg model ready.')"
 
-echo "[4/5] MiDaS downloads automatically on first inference via torch.hub."
+echo "[5/5] MiDaS downloads automatically on first inference via torch.hub."
 
 echo "[5/5] HuggingFace login (needed for SAM3 fallback, optional here)..."
 if [ -n "$HF_TOKEN" ]; then

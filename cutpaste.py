@@ -1,12 +1,12 @@
 """
-Cut & Paste — MODNet + MiDaS pipeline.
+Cut & Paste — rembg + MiDaS pipeline.
 
-  MODNet  : portrait alpha matting  (~30ms, replaces SAM3)
-  MiDaS   : depth estimation        (~40ms, drives shadow generation)
+  rembg (u2net_human_seg) : portrait alpha matting (~30ms, auto-downloads ~170MB)
+  MiDaS small             : depth estimation       (~40ms, auto-downloads ~80MB)
 
 Pipeline:
-  1. MODNet  → clean alpha matte (hair/edge aware)
-  2. MiDaS  → depth map of background
+  1. rembg   → clean alpha matte (hair/edge aware, GPU ONNX)
+  2. MiDaS   → depth map of background
   3. Cover-crop background to 768×1024
   4. Scale person to person_fill % of frame height
   5. Alpha composite
@@ -14,8 +14,6 @@ Pipeline:
   7. Optional Reinhard color harmonization
 """
 
-import os
-import sys
 import torch
 import numpy as np
 from PIL import Image
@@ -23,85 +21,36 @@ from scipy.ndimage import gaussian_filter
 
 OUTPUT_W, OUTPUT_H = 768, 1024
 
-# MODNet repo cloned by setup.sh
-MODNET_REPO = os.environ.get("MODNET_REPO", "/workspace/MODNet")
-MODNET_CKPT = os.path.join(MODNET_REPO, "modnet_photographic_portrait_matting.ckpt")
-
-_modnet  = None
-_midas   = None
+_rembg_session = None
+_midas  = None
 _midas_t = None
 
 
 # ---------------------------------------------------------------------------
-# MODNet — portrait alpha matting
+# rembg — portrait alpha matting (u2net_human_seg, GPU ONNX)
 # ---------------------------------------------------------------------------
 
-def _load_modnet(device="cuda"):
-    global _modnet
-    if _modnet is not None:
-        return _modnet
-
-    if not os.path.exists(MODNET_CKPT):
-        raise FileNotFoundError(
-            f"MODNet weights not found at {MODNET_CKPT}. "
-            "Run setup.sh to download them."
-        )
-
-    repo_src = os.path.join(MODNET_REPO, "src")
-    if repo_src not in sys.path:
-        sys.path.insert(0, repo_src)
-
-    from models.modnet import MODNet
-
-    print("Loading MODNet...")
-    net = MODNet(backbone_pretrained=False)
-    ckpt = torch.load(MODNET_CKPT, map_location=device)
-    # Strip DataParallel 'module.' prefix if present
-    if any(k.startswith("module.") for k in ckpt.keys()):
-        ckpt = {k[7:]: v for k, v in ckpt.items()}
-    net.load_state_dict(ckpt)
-    net.to(device).eval()
-    _modnet = net
-    print("MODNet loaded.")
-    return _modnet
+def _load_rembg():
+    global _rembg_session
+    if _rembg_session is not None:
+        return _rembg_session
+    from rembg import new_session
+    print("Loading rembg u2net_human_seg...")
+    _rembg_session = new_session("u2net_human_seg")
+    print("rembg ready.")
+    return _rembg_session
 
 
 def _matte_person(image: Image.Image, device="cuda") -> np.ndarray:
     """
-    MODNet inference on a PIL RGB image.
+    rembg inference on a PIL RGB image.
     Returns float32 alpha matte, same size as input, values 0.0-1.0.
     """
-    from torchvision import transforms as T
-
-    model = _load_modnet(device)
-    orig_w, orig_h = image.size
-
-    # MODNet reference size: 512 on the longer side, dims must be mult of 32
-    ref = 512
-    if orig_w >= orig_h:
-        proc_h = ref
-        proc_w = int(orig_w * ref / orig_h)
-    else:
-        proc_w = ref
-        proc_h = int(orig_h * ref / orig_w)
-    proc_h = (proc_h // 32) * 32
-    proc_w = (proc_w // 32) * 32
-
-    tfm = T.Compose([
-        T.Resize((proc_h, proc_w)),
-        T.ToTensor(),
-        T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    ])
-    img_t = tfm(image).unsqueeze(0).to(device)
-
-    with torch.no_grad():
-        _, _, matte = model(img_t, True)
-
-    matte_np = matte.squeeze().cpu().numpy()  # [0,1] float32
-    matte_pil = Image.fromarray((matte_np * 255).astype(np.uint8)).resize(
-        (orig_w, orig_h), Image.LANCZOS
-    )
-    return np.array(matte_pil).astype(np.float32) / 255.0
+    from rembg import remove
+    session = _load_rembg()
+    rgba    = remove(image, session=session)          # PIL RGBA
+    alpha   = np.array(rgba)[:, :, 3].astype(np.float32) / 255.0
+    return alpha
 
 
 # ---------------------------------------------------------------------------
