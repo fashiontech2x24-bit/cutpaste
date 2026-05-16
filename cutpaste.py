@@ -86,6 +86,7 @@ def replace_background(
     prompt="person",
     confidence_threshold=0.5,
     feather_sigma=3.0,
+    person_fill=0.75,
     device="cuda",
 ):
     """
@@ -128,10 +129,10 @@ def replace_background(
     # Feather the mask edges
     mask = _feather_mask(mask, sigma=feather_sigma)
 
-    # Scale person to fit inside 768×1024, preserving aspect ratio.
-    # scale-to-fit: person touches the longer edge of the canvas.
+    # Scale person so height = person_fill * OUTPUT_H (e.g. 75% = 768px tall).
+    # Also clamp width to OUTPUT_W so wide portraits never overflow the canvas.
     p_w, p_h = portrait.size
-    fit_scale = min(OUTPUT_W / p_w, OUTPUT_H / p_h)
+    fit_scale = min(OUTPUT_W / p_w, OUTPUT_H * person_fill / p_h)
     new_w = int(p_w * fit_scale)
     new_h = int(p_h * fit_scale)
 

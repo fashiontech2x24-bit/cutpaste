@@ -214,12 +214,16 @@ _HTML = """<!DOCTYPE html>
         <input type="text" id="inp-prompt" value="person" placeholder="person"/>
       </div>
       <div>
-        <label class="field-label" for="inp-conf">Confidence Threshold</label>
-        <input type="number" id="inp-conf" value="0.5" min="0.0" max="1.0" step="0.05"/>
+        <label class="field-label" for="inp-fill">Person Fill (% of frame height)</label>
+        <input type="number" id="inp-fill" value="75" min="10" max="100" step="5"/>
       </div>
       <div>
         <label class="field-label" for="inp-feather">Edge Feather (σ)</label>
         <input type="number" id="inp-feather" value="3.0" min="0.0" max="20.0" step="0.5"/>
+      </div>
+      <div>
+        <label class="field-label" for="inp-conf">Confidence Threshold</label>
+        <input type="number" id="inp-conf" value="0.5" min="0.0" max="1.0" step="0.05"/>
       </div>
     </div>
   </details>
@@ -300,6 +304,7 @@ _HTML = """<!DOCTYPE html>
     form.append('prompt', document.getElementById('inp-prompt').value || 'person');
     form.append('confidence', document.getElementById('inp-conf').value);
     form.append('feather', document.getElementById('inp-feather').value);
+    form.append('person_fill', document.getElementById('inp-fill').value / 100);
 
     try {
       const res = await fetch('/api/process', { method: 'POST', body: form });
@@ -352,6 +357,7 @@ async def process(
     prompt: str = Form("person"),
     confidence: float = Form(0.5),
     feather: float = Form(3.0),
+    person_fill: float = Form(0.75),
 ):
     """
     Segment the person from `portrait` using SAM3 and composite onto `background`.
@@ -378,6 +384,7 @@ async def process(
                 prompt=prompt,
                 confidence_threshold=confidence,
                 feather_sigma=feather,
+                person_fill=person_fill,
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
