@@ -28,6 +28,9 @@ echo "Installing ML dependencies..."
 pip install "transformers>=5.0" huggingface_hub scipy pillow
 
 echo "Installing harmonization (libcom / PCTNet)..."
+# chumpy (mmpose dep) is abandoned and tries to import pip internally.
+# --no-build-isolation makes setuptools use the environment's pip instead.
+pip install chumpy --no-build-isolation
 pip install libcom
 
 echo "Installing server dependencies..."
