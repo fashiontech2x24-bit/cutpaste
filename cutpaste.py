@@ -16,6 +16,8 @@ _processor = None
 
 MODEL_ID = "facebook/sam3"
 
+OUTPUT_W, OUTPUT_H = 768, 1024  # standard output canvas (portrait 3:4)
+
 
 def _load_model(device="cuda"):
     """Load SAM3 model and processor (singleton, cached after first call)."""
@@ -104,6 +106,19 @@ def replace_background(
     portrait = Image.open(portrait_path).convert("RGB")
     background = Image.open(background_path).convert("RGB")
 
+    # --- Scale background to cover 768×1024, then center-crop ---
+    # "Cover" = scale up until both dims >= output, then crop centre.
+    # No letterboxing; background always fills the full canvas.
+    bg_w, bg_h = background.size
+    cover_scale = max(OUTPUT_W / bg_w, OUTPUT_H / bg_h)
+    bg_scaled_w = int(bg_w * cover_scale)
+    bg_scaled_h = int(bg_h * cover_scale)
+    background = background.resize((bg_scaled_w, bg_scaled_h), Image.LANCZOS)
+    crop_x = (bg_scaled_w - OUTPUT_W) // 2
+    crop_y = (bg_scaled_h - OUTPUT_H) // 2
+    background = background.crop((crop_x, crop_y, crop_x + OUTPUT_W, crop_y + OUTPUT_H))
+    # background is now exactly 768×1024
+
     # Segment the person
     mask = _segment_person(portrait, prompt=prompt, confidence_threshold=confidence_threshold, device=device)
 
@@ -113,36 +128,33 @@ def replace_background(
     # Feather the mask edges
     mask = _feather_mask(mask, sigma=feather_sigma)
 
-    # Resize person + mask to fit on background, maintaining aspect ratio
-    bg_w, bg_h = background.size
+    # Scale person to fit inside 768×1024, preserving aspect ratio.
+    # scale-to-fit: person touches the longer edge of the canvas.
     p_w, p_h = portrait.size
-
-    scale = min(bg_w / p_w, bg_h / p_h)
-    new_w = int(p_w * scale)
-    new_h = int(p_h * scale)
+    fit_scale = min(OUTPUT_W / p_w, OUTPUT_H / p_h)
+    new_w = int(p_w * fit_scale)
+    new_h = int(p_h * fit_scale)
 
     portrait_resized = portrait.resize((new_w, new_h), Image.LANCZOS)
     mask_resized = np.array(
         Image.fromarray((mask * 255).astype(np.uint8)).resize((new_w, new_h), Image.LANCZOS)
     ).astype(np.float32) / 255.0
 
-    # Center the person on the background
-    x_offset = (bg_w - new_w) // 2
-    y_offset = (bg_h - new_h) // 2
+    # Center the person on the 768×1024 canvas
+    x_offset = (OUTPUT_W - new_w) // 2
+    y_offset = (OUTPUT_H - new_h) // 2
 
     # Composite
-    result = background.copy()
+    result_arr = np.array(background).astype(np.float32)
     portrait_arr = np.array(portrait_resized).astype(np.float32)
-    result_arr = np.array(result).astype(np.float32)
 
-    # Apply mask as alpha blend in the placement region
     region = result_arr[y_offset : y_offset + new_h, x_offset : x_offset + new_w]
-    alpha = mask_resized[..., np.newaxis]  # (H, W, 1)
+    alpha = mask_resized[..., np.newaxis]
     blended = portrait_arr * alpha + region * (1.0 - alpha)
     result_arr[y_offset : y_offset + new_h, x_offset : x_offset + new_w] = blended
 
     result = Image.fromarray(result_arr.astype(np.uint8))
     result.save(output_path)
-    print(f"Saved composited image to {output_path}")
+    print(f"Saved {OUTPUT_W}×{OUTPUT_H} composited image to {output_path}")
 
     return output_path
