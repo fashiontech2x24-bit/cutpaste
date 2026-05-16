@@ -28,9 +28,11 @@ echo "Installing ML dependencies..."
 pip install "transformers>=5.0" huggingface_hub scipy pillow
 
 echo "Installing harmonization (libcom / PCTNet)..."
-# PyPI libcom is missing source/src model code — must install from GitHub.
-# --no-deps skips mmpose/mmdet which have broken build scripts (chumpy, xtcocotools).
-pip install "git+https://github.com/bcmi/libcom.git" --no-deps
+# libcom uses git submodules for LBM source code which pip install git+ doesn't fetch.
+# Must clone with --recurse-submodules then install from local path.
+# --no-deps skips mmpose/mmdet which have broken build scripts.
+git clone --recurse-submodules https://github.com/bcmi/libcom.git /tmp/libcom_src
+pip install -e /tmp/libcom_src --no-deps
 pip install lpips timm einops diffusers==0.34.0 opencv-python
 
 echo "Installing server dependencies..."
