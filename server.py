@@ -211,11 +211,11 @@ _HTML = """<!DOCTYPE html>
     <div class="settings-grid" style="margin-top:0.5rem;">
       <div>
         <label class="field-label" for="inp-fill">Person Fill (% of frame height)</label>
-        <input type="number" id="inp-fill" value="82" min="10" max="100" step="1"/>
+        <input type="number" id="inp-fill" value="90" min="10" max="100" step="1"/>
       </div>
       <div>
         <label class="field-label" for="inp-foot">Foot Anchor (% from top)</label>
-        <input type="number" id="inp-foot" value="87" min="50" max="98" step="1"/>
+        <input type="number" id="inp-foot" value="90" min="50" max="98" step="1"/>
       </div>
       <div>
         <label class="field-label" for="inp-shadow-str">Shadow Strength</label>
@@ -404,8 +404,8 @@ async def process(
     prompt:          str   = Form("person"),
     confidence:      float = Form(0.5),
     feather:         float = Form(3.0),
-    person_fill:     float = Form(0.82),
-    foot_anchor:     float = Form(0.87),
+    person_fill:     float = Form(0.90),
+    foot_anchor:     float = Form(0.90),
     shadow:          int   = Form(1),
     shadow_strength: float = Form(0.55),
     ambient_light:   int   = Form(1),

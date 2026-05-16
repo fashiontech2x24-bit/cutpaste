@@ -185,12 +185,13 @@ def _lab_to_rgb(lab):
     return np.clip(rgb, 0.0, 1.0)
 
 
-def _ambient_light_match(composite_arr, canvas_mask, strength=0.30):
+def _ambient_light_match(composite_arr, canvas_mask, strength=0.45):
     """
-    Shift the person's color temperature to match the background scene WITHOUT
-    touching luminance. Only the a* and b* Lab channels are shifted (chroma /
-    hue), so the person stays the same brightness but picks up the background's
-    warm / cool cast — simulating environmental light spill with no extra model.
+    Shift the person's Lab values toward the background scene.
+    - a* / b*: full strength  → color temperature / hue match
+    - L*     : half strength  → gentle brightness match so neutral/gray
+                                backgrounds (zero chroma difference) still
+                                produce a visible lighting adjustment.
     """
     img = composite_arr / 255.0
     lab = _rgb_to_lab(img)
@@ -202,11 +203,11 @@ def _ambient_light_match(composite_arr, canvas_mask, strength=0.30):
         return composite_arr
 
     result_lab = lab.copy()
-    for ch in [1, 2]:          # a* (green↔red) and b* (blue↔yellow) only — skip L*
+    strengths = [strength * 0.5, strength, strength]   # L*, a*, b*
+    for ch in range(3):
         bg_mean = lab[..., ch][bg].mean()
         fg_mean = lab[..., ch][fg].mean()
-        shift   = (bg_mean - fg_mean) * strength
-        # Blend shift by mask alpha so edges fade in naturally
+        shift   = (bg_mean - fg_mean) * strengths[ch]
         result_lab[..., ch] = np.where(
             canvas_mask > 0.05,
             lab[..., ch] + shift * canvas_mask,
@@ -265,13 +266,13 @@ def replace_background(
     confidence_threshold=0.5,
     erode_px=4,
     feather_sigma=3.0,
-    person_fill=0.82,
-    foot_anchor=0.87,
+    person_fill=0.90,
+    foot_anchor=0.90,
     shadow=True,
     shadow_strength=0.55,
     harmonize=False,
-    ambient_light=False,
-    ambient_strength=0.30,
+    ambient_light=True,
+    ambient_strength=0.45,
     device="cuda",
 ):
     """
@@ -319,15 +320,13 @@ def replace_background(
     px0 = max(foot_x - 30, 0);  px1 = min(foot_x + 30, OUTPUT_W)
     ground_depth = float(bg_depth[py0:py1, px0:px1].mean())  # 0=far, 1=close
 
-    # --- Depth-aware scale ---
-    # person_fill is the intended height.  Depth nudges ±12% — flat/far backgrounds
-    # used to collapse the range to 0.65×, making the person tiny.  Keep it tight
-    # so person_fill is always close to what the user asked for.
-    depth_scale = 0.90 + ground_depth * 0.22   # range 0.90–1.12
-    effective_fill = np.clip(person_fill * depth_scale, 0.4, 1.0)
-
+    # --- Scale: height-driven only so person_fill is always honoured ---
+    # The old min(width, height) let wide portraits be constrained by width,
+    # making the person far shorter than person_fill requested.
+    # We now scale by height exclusively; if the result is wider than the canvas
+    # the sides are symmetrically clipped (person body stays centred).
     p_w, p_h  = portrait.size
-    fit_scale = min(OUTPUT_W / p_w, OUTPUT_H * effective_fill / p_h)
+    fit_scale = OUTPUT_H * person_fill / p_h
     new_w     = int(p_w * fit_scale)
     new_h     = int(p_h * fit_scale)
 
@@ -336,27 +335,32 @@ def replace_background(
         Image.fromarray((mask * 255).astype(np.uint8)).resize((new_w, new_h), Image.LANCZOS)
     ).astype(np.float32) / 255.0
 
-    # --- Foot-anchored placement (replaces blind vertical centering) ---
-    # Feet sit at foot_y; person grows upward from there.
-    x_off = (OUTPUT_W - new_w) // 2
-    y_off = max(foot_y - new_h, 0)           # clamp so person never goes above frame top
+    # --- Foot-anchored placement ---
+    # Centre horizontally; clip if new_w > OUTPUT_W (wide portraits).
+    x_off = (OUTPUT_W - new_w) // 2        # negative when person wider than canvas
+    y_off = max(foot_y - new_h, 0)         # clamp so head never goes above frame top
+
+    # Canvas & person slice coordinates (handle wide-portrait clipping)
+    xc0 = max(x_off, 0);          xc1 = min(x_off + new_w, OUTPUT_W)
+    xp0 = xc0 - x_off;            xp1 = xp0 + (xc1 - xc0)
+    yc0 = y_off;                   yc1 = min(y_off + new_h, OUTPUT_H)
+    yp0 = 0;                       yp1 = yc1 - yc0
 
     # --- Canvas mask ---
     canvas_mask = np.zeros((OUTPUT_H, OUTPUT_W), dtype=np.float32)
-    canvas_mask[y_off : y_off + new_h, x_off : x_off + new_w] = mask_resized
+    canvas_mask[yc0:yc1, xc0:xc1] = mask_resized[yp0:yp1, xp0:xp1]
 
     # --- Alpha composite with edge spill suppression ---
-    result_arr   = np.array(background).astype(np.float32)
-    person_arr   = np.array(portrait_resized).astype(np.float32)
-    alpha        = mask_resized[..., np.newaxis]
-    region       = result_arr[y_off : y_off + new_h, x_off : x_off + new_w]
+    result_arr  = np.array(background).astype(np.float32)
+    person_arr  = np.array(portrait_resized).astype(np.float32)
+    alpha       = mask_resized[yp0:yp1, xp0:xp1][..., np.newaxis]
+    region      = result_arr[yc0:yc1, xc0:xc1]
+    person_crop = person_arr[yp0:yp1, xp0:xp1]
 
-    edge_zone    = 4.0 * alpha * (1.0 - alpha)  # peaks at blend boundary
+    edge_zone    = 4.0 * alpha * (1.0 - alpha)
     SPILL        = 0.45
-    person_clean = person_arr * (1.0 - edge_zone * SPILL) + region * (edge_zone * SPILL)
-    result_arr[y_off : y_off + new_h, x_off : x_off + new_w] = (
-        person_clean * alpha + region * (1.0 - alpha)
-    )
+    person_clean = person_crop * (1.0 - edge_zone * SPILL) + region * (edge_zone * SPILL)
+    result_arr[yc0:yc1, xc0:xc1] = person_clean * alpha + region * (1.0 - alpha)
 
     # --- Find actual foot position from mask bottom (not the target anchor) ---
     # foot_anchor is where we AIM to place the feet, but the portrait may have
