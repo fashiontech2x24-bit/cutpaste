@@ -1,12 +1,15 @@
 """
-Cut & Paste: Person Background Replacement using SAM3.
+Cut & Paste: Person Background Replacement using SAM3 + MiDaS.
 
 Pipeline:
-  1. SAM3 text-prompted segmentation → person mask
-  2. Gaussian edge feathering
-  3. Scale background to 768×1024 (cover-crop)
-  4. Scale person to person_fill % of frame height, alpha-composite
-  5. Reinhard color transfer — matches person's L*a*b* tone/lighting to background
+  1. SAM3  → person mask
+  2. Mask erosion + Gaussian feather (removes edge fringing)
+  3. MiDaS → background depth map
+  4. Cover-crop background to 768×1024
+  5. Depth-aware person scale + foot-anchored placement
+  6. Alpha composite with edge spill suppression
+  7. Depth-driven drop shadow below feet
+  8. Optional Reinhard color harmonization
 """
 
 import torch
@@ -14,8 +17,10 @@ import numpy as np
 from PIL import Image
 from scipy.ndimage import gaussian_filter
 
-_sam_model = None
+_sam_model     = None
 _sam_processor = None
+_midas         = None
+_midas_t       = None
 
 MODEL_ID = "facebook/sam3"
 OUTPUT_W, OUTPUT_H = 768, 1024
@@ -64,19 +69,70 @@ def _segment_person(image, prompt="person", confidence_threshold=0.5, device="cu
 
 def _refine_mask(mask, erode_px=4, feather_sigma=3.0):
     """
-    1. Erode the binary mask inward by erode_px pixels.
-       This pulls the boundary past the fringe zone where edge pixels
-       contain a mix of person + original background color.
-    2. Gaussian feather from the clean eroded boundary for smooth blending.
-
-    Better than naive Gaussian-on-raw-mask which blends in fringe pixels.
+    Erode binary mask inward then Gaussian-feather.
+    Erosion discards fringe pixels mixed with the original shoot background
+    before feathering, giving a cleaner blend boundary.
     """
     from scipy.ndimage import binary_erosion
-
     binary = mask > 0.5
     if erode_px > 0:
         binary = binary_erosion(binary, iterations=erode_px)
     return np.clip(gaussian_filter(binary.astype(np.float32), sigma=feather_sigma), 0.0, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# MiDaS — monocular depth estimation (small, ~40ms, auto-downloads via hub)
+# ---------------------------------------------------------------------------
+
+def _load_midas(device="cuda"):
+    global _midas, _midas_t
+    if _midas is not None:
+        return _midas, _midas_t
+    print("Loading MiDaS small...")
+    _midas   = torch.hub.load("intel-isl/MiDaS", "MiDaS_small", trust_repo=True)
+    _midas.to(device).eval()
+    _midas_t = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True).small_transform
+    print("MiDaS loaded.")
+    return _midas, _midas_t
+
+
+def _estimate_depth(image: Image.Image, device="cuda") -> np.ndarray:
+    """Returns float32 depth map same size as image. 1.0 = closest, 0.0 = farthest."""
+    model, transform = _load_midas(device)
+    img_np = np.array(image)
+    batch  = transform(img_np).to(device)
+    with torch.no_grad():
+        depth = model(batch)
+        depth = torch.nn.functional.interpolate(
+            depth.unsqueeze(1), size=img_np.shape[:2],
+            mode="bicubic", align_corners=False,
+        ).squeeze()
+    d = depth.cpu().numpy().astype(np.float32)
+    return (d - d.min()) / (d.max() - d.min() + 1e-8)
+
+
+def _drop_shadow(canvas, canvas_mask, foot_x, foot_y, person_w, ground_depth,
+                 strength=0.55):
+    """
+    Elliptical drop shadow anchored at (foot_x, foot_y).
+    Shadow is larger/darker when ground is close (high depth value).
+    """
+    sw      = int(person_w * 0.55)
+    sh      = max(int(sw * 0.18 * (0.4 + ground_depth * 0.6)), 4)
+    opacity = strength * (0.3 + ground_depth * 0.7)
+
+    Y, X = np.ogrid[:OUTPUT_H, :OUTPUT_W]
+    dist   = ((X - foot_x) / (sw + 1e-6)) ** 2 + ((Y - foot_y) / (sh + 1e-6)) ** 2
+    shadow = np.clip(1.0 - dist, 0.0, 1.0)
+    shadow = gaussian_filter(shadow, sigma=sh * 0.6)
+    shadow = shadow / (shadow.max() + 1e-8)
+    # Don't overdraw on solid person pixels
+    shadow = shadow * (1.0 - np.clip(canvas_mask - 0.7, 0, 0.3) / 0.3)
+    shadow = shadow[..., np.newaxis] * opacity
+
+    out = canvas.copy()
+    out = np.clip(out * (1.0 - shadow), 0, 255)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +235,9 @@ def replace_background(
     erode_px=4,
     feather_sigma=3.0,
     person_fill=0.75,
+    foot_anchor=0.87,
+    shadow=True,
+    shadow_strength=0.55,
     harmonize=False,
     device="cuda",
 ):
@@ -216,9 +275,23 @@ def replace_background(
 
     mask = _refine_mask(mask, erode_px=erode_px, feather_sigma=feather_sigma)
 
-    # Scale person: height = person_fill × OUTPUT_H, width clamped to OUTPUT_W
+    # --- MiDaS depth: sample ground depth at foot-landing point ---
+    foot_y  = int(OUTPUT_H * foot_anchor)   # pixel row where feet touch ground
+    foot_x  = OUTPUT_W // 2
+    bg_depth = _estimate_depth(background, device=device)
+    # Sample a small patch around the foot landing point for stability
+    py0 = max(foot_y - 10, 0);  py1 = min(foot_y + 10, OUTPUT_H)
+    px0 = max(foot_x - 30, 0);  px1 = min(foot_x + 30, OUTPUT_W)
+    ground_depth = float(bg_depth[py0:py1, px0:px1].mean())  # 0=far, 1=close
+
+    # --- Depth-aware scale ---
+    # person_fill sets max height. Scale up/down by ground depth so
+    # a close ground (depth≈1) gives a larger person, far ground (depth≈0) smaller.
+    depth_scale = 0.65 + ground_depth * 0.7   # range ~0.65–1.35
+    effective_fill = np.clip(person_fill * depth_scale, 0.3, 1.0)
+
     p_w, p_h  = portrait.size
-    fit_scale = min(OUTPUT_W / p_w, OUTPUT_H * person_fill / p_h)
+    fit_scale = min(OUTPUT_W / p_w, OUTPUT_H * effective_fill / p_h)
     new_w     = int(p_w * fit_scale)
     new_h     = int(p_h * fit_scale)
 
@@ -227,33 +300,34 @@ def replace_background(
         Image.fromarray((mask * 255).astype(np.uint8)).resize((new_w, new_h), Image.LANCZOS)
     ).astype(np.float32) / 255.0
 
-    # Center on canvas
+    # --- Foot-anchored placement (replaces blind vertical centering) ---
+    # Feet sit at foot_y; person grows upward from there.
     x_off = (OUTPUT_W - new_w) // 2
-    y_off = (OUTPUT_H - new_h) // 2
+    y_off = max(foot_y - new_h, 0)           # clamp so person never goes above frame top
 
-    # Build canvas-sized mask for harmonization
+    # --- Canvas mask ---
     canvas_mask = np.zeros((OUTPUT_H, OUTPUT_W), dtype=np.float32)
     canvas_mask[y_off : y_off + new_h, x_off : x_off + new_w] = mask_resized
 
-    # Alpha composite with edge spill suppression
-    # Edge pixels of the portrait contain a mix of person + original background.
-    # In the blend zone (0 < alpha < 1) we nudge person colors toward the new
-    # background, which removes color fringing from the original shoot.
+    # --- Alpha composite with edge spill suppression ---
     result_arr   = np.array(background).astype(np.float32)
     person_arr   = np.array(portrait_resized).astype(np.float32)
     alpha        = mask_resized[..., np.newaxis]
     region       = result_arr[y_off : y_off + new_h, x_off : x_off + new_w]
 
-    # Peaks at 1.0 where alpha=0.5 (the boundary), zero at solid interior/exterior
-    edge_zone    = 4.0 * alpha * (1.0 - alpha)
-    SPILL        = 0.45  # suppression strength — higher = cleaner edges, less person detail
+    edge_zone    = 4.0 * alpha * (1.0 - alpha)  # peaks at blend boundary
+    SPILL        = 0.45
     person_clean = person_arr * (1.0 - edge_zone * SPILL) + region * (edge_zone * SPILL)
-
     result_arr[y_off : y_off + new_h, x_off : x_off + new_w] = (
         person_clean * alpha + region * (1.0 - alpha)
     )
 
-    # Reinhard color harmonization
+    # --- Depth-driven drop shadow ---
+    if shadow:
+        result_arr = _drop_shadow(result_arr, canvas_mask, foot_x, foot_y,
+                                  new_w, ground_depth, strength=shadow_strength)
+
+    # --- Reinhard color harmonization ---
     if harmonize:
         result_arr = _reinhard_transfer(result_arr, canvas_mask)
 
