@@ -59,7 +59,7 @@ def _segment_person(image, prompt="person", confidence_threshold=0.5, device="cu
     return masks[best].cpu().numpy().astype(np.float32)
 
 
-def _refine_mask(mask, erode_px=4, feather_sigma=3.0):
+def _refine_mask(mask, erode_px=2, feather_sigma=1.5):
     from scipy.ndimage import binary_erosion
     binary = mask > 0.5
     if erode_px > 0:
@@ -73,8 +73,8 @@ def replace_background(
     output_path,
     prompt="person",
     confidence_threshold=0.5,
-    erode_px=4,
-    feather_sigma=3.0,
+    erode_px=2,
+    feather_sigma=1.5,
     person_fill=0.92,
     foot_anchor=0.92,
     device="cuda",
@@ -136,7 +136,7 @@ def replace_background(
     person_crop = person_arr[yp0:yp1, xp0:xp1]
 
     edge_zone    = 4.0 * alpha * (1.0 - alpha)
-    SPILL        = 0.45
+    SPILL        = 0.10
     person_clean = person_crop * (1.0 - edge_zone * SPILL) + region * (edge_zone * SPILL)
     result_arr[yc0:yc1, xc0:xc1] = person_clean * alpha + region * (1.0 - alpha)
 

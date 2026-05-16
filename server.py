@@ -151,7 +151,11 @@ _HTML = """<!DOCTYPE html>
       </div>
       <div>
         <label class="field-label" for="inp-feather">Edge Feather (σ)</label>
-        <input type="number" id="inp-feather" value="3.0" min="0.0" max="20.0" step="0.5"/>
+        <input type="number" id="inp-feather" value="1.5" min="0.0" max="10.0" step="0.5"/>
+      </div>
+      <div>
+        <label class="field-label" for="inp-erode">Edge Erode (px)</label>
+        <input type="number" id="inp-erode" value="2" min="0" max="10" step="1"/>
       </div>
       <div>
         <label class="field-label" for="inp-conf">Confidence Threshold</label>
@@ -219,6 +223,7 @@ _HTML = """<!DOCTYPE html>
     form.append('prompt',      document.getElementById('inp-prompt').value || 'person');
     form.append('confidence',  document.getElementById('inp-conf').value);
     form.append('feather',     document.getElementById('inp-feather').value);
+    form.append('erode',       document.getElementById('inp-erode').value);
     form.append('person_fill', document.getElementById('inp-fill').value / 100);
     form.append('foot_anchor', document.getElementById('inp-foot').value / 100);
 
@@ -267,7 +272,8 @@ async def process(
     background:  UploadFile = File(...),
     prompt:      str   = Form("person"),
     confidence:  float = Form(0.5),
-    feather:     float = Form(3.0),
+    feather:     float = Form(1.5),
+    erode:       int   = Form(2),
     person_fill: float = Form(0.92),
     foot_anchor: float = Form(0.92),
 ):
@@ -289,6 +295,7 @@ async def process(
                 prompt=prompt,
                 confidence_threshold=confidence,
                 feather_sigma=feather,
+                erode_px=erode,
                 person_fill=person_fill,
                 foot_anchor=foot_anchor,
             )
