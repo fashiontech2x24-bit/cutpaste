@@ -62,8 +62,21 @@ def _segment_person(image, prompt="person", confidence_threshold=0.5, device="cu
     return masks[best].cpu().numpy().astype(np.float32)
 
 
-def _feather_mask(mask, sigma=3.0):
-    return np.clip(gaussian_filter(mask, sigma=sigma), 0.0, 1.0)
+def _refine_mask(mask, erode_px=4, feather_sigma=3.0):
+    """
+    1. Erode the binary mask inward by erode_px pixels.
+       This pulls the boundary past the fringe zone where edge pixels
+       contain a mix of person + original background color.
+    2. Gaussian feather from the clean eroded boundary for smooth blending.
+
+    Better than naive Gaussian-on-raw-mask which blends in fringe pixels.
+    """
+    from scipy.ndimage import binary_erosion
+
+    binary = mask > 0.5
+    if erode_px > 0:
+        binary = binary_erosion(binary, iterations=erode_px)
+    return np.clip(gaussian_filter(binary.astype(np.float32), sigma=feather_sigma), 0.0, 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +176,7 @@ def replace_background(
     output_path,
     prompt="person",
     confidence_threshold=0.5,
+    erode_px=4,
     feather_sigma=3.0,
     person_fill=0.75,
     harmonize=False,
@@ -200,7 +214,7 @@ def replace_background(
     if mask is None:
         raise ValueError(f"No '{prompt}' detected above threshold {confidence_threshold}")
 
-    mask = _feather_mask(mask, sigma=feather_sigma)
+    mask = _refine_mask(mask, erode_px=erode_px, feather_sigma=feather_sigma)
 
     # Scale person: height = person_fill × OUTPUT_H, width clamped to OUTPUT_W
     p_w, p_h  = portrait.size
@@ -221,13 +235,22 @@ def replace_background(
     canvas_mask = np.zeros((OUTPUT_H, OUTPUT_W), dtype=np.float32)
     canvas_mask[y_off : y_off + new_h, x_off : x_off + new_w] = mask_resized
 
-    # Alpha composite
-    result_arr  = np.array(background).astype(np.float32)
-    person_arr  = np.array(portrait_resized).astype(np.float32)
-    alpha       = mask_resized[..., np.newaxis]
-    region      = result_arr[y_off : y_off + new_h, x_off : x_off + new_w]
+    # Alpha composite with edge spill suppression
+    # Edge pixels of the portrait contain a mix of person + original background.
+    # In the blend zone (0 < alpha < 1) we nudge person colors toward the new
+    # background, which removes color fringing from the original shoot.
+    result_arr   = np.array(background).astype(np.float32)
+    person_arr   = np.array(portrait_resized).astype(np.float32)
+    alpha        = mask_resized[..., np.newaxis]
+    region       = result_arr[y_off : y_off + new_h, x_off : x_off + new_w]
+
+    # Peaks at 1.0 where alpha=0.5 (the boundary), zero at solid interior/exterior
+    edge_zone    = 4.0 * alpha * (1.0 - alpha)
+    SPILL        = 0.45  # suppression strength — higher = cleaner edges, less person detail
+    person_clean = person_arr * (1.0 - edge_zone * SPILL) + region * (edge_zone * SPILL)
+
     result_arr[y_off : y_off + new_h, x_off : x_off + new_w] = (
-        person_arr * alpha + region * (1.0 - alpha)
+        person_clean * alpha + region * (1.0 - alpha)
     )
 
     # Reinhard color harmonization
