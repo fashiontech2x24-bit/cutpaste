@@ -185,6 +185,37 @@ def _lab_to_rgb(lab):
     return np.clip(rgb, 0.0, 1.0)
 
 
+def _ambient_light_match(composite_arr, canvas_mask, strength=0.30):
+    """
+    Shift the person's color temperature to match the background scene WITHOUT
+    touching luminance. Only the a* and b* Lab channels are shifted (chroma /
+    hue), so the person stays the same brightness but picks up the background's
+    warm / cool cast — simulating environmental light spill with no extra model.
+    """
+    img = composite_arr / 255.0
+    lab = _rgb_to_lab(img)
+
+    fg = canvas_mask > 0.5
+    bg = canvas_mask < 0.1
+
+    if fg.sum() < 100 or bg.sum() < 100:
+        return composite_arr
+
+    result_lab = lab.copy()
+    for ch in [1, 2]:          # a* (green↔red) and b* (blue↔yellow) only — skip L*
+        bg_mean = lab[..., ch][bg].mean()
+        fg_mean = lab[..., ch][fg].mean()
+        shift   = (bg_mean - fg_mean) * strength
+        # Blend shift by mask alpha so edges fade in naturally
+        result_lab[..., ch] = np.where(
+            canvas_mask > 0.05,
+            lab[..., ch] + shift * canvas_mask,
+            lab[..., ch],
+        )
+
+    return np.clip(_lab_to_rgb(result_lab) * 255.0, 0, 255).astype(np.float32)
+
+
 def _reinhard_transfer(composite_arr, canvas_mask, strength=0.35):
     """
     Gently shift the person's L*a*b* mean toward the background's mean.
@@ -239,6 +270,8 @@ def replace_background(
     shadow=True,
     shadow_strength=0.55,
     harmonize=False,
+    ambient_light=False,
+    ambient_strength=0.30,
     device="cuda",
 ):
     """
@@ -253,7 +286,9 @@ def replace_background(
         confidence_threshold: Min SAM3 confidence for mask selection.
         feather_sigma:        Gaussian blur sigma for edge feathering.
         person_fill:          Person height as fraction of OUTPUT_H (default 0.75).
-        harmonize:            Run Reinhard color transfer after compositing.
+        harmonize:            Run Reinhard color transfer (adjusts L, a*, b*).
+        ambient_light:        Shift person color temperature to match scene (a*, b* only).
+        ambient_strength:     Blend strength for ambient light shift (default 0.30).
         device:               Torch device ("cuda" or "cpu").
     """
     portrait   = Image.open(portrait_path).convert("RGB")
@@ -322,12 +357,24 @@ def replace_background(
         person_clean * alpha + region * (1.0 - alpha)
     )
 
-    # --- Depth-driven drop shadow ---
+    # --- Find actual foot position from mask bottom (not the target anchor) ---
+    # foot_anchor is where we AIM to place the feet, but the portrait may have
+    # blank space below the person inside its bounding box.  Using foot_y directly
+    # as the shadow center leaves a visible gap between the person and the shadow.
+    mask_rows = np.any(canvas_mask > 0.1, axis=1)
+    actual_foot_y = int(np.where(mask_rows)[0][-1]) if mask_rows.any() else foot_y
+
+    # --- Depth-driven drop shadow anchored to actual feet ---
     if shadow:
-        result_arr = _drop_shadow(result_arr, canvas_mask, foot_x, foot_y,
+        result_arr = _drop_shadow(result_arr, canvas_mask, foot_x, actual_foot_y,
                                   new_w, ground_depth, strength=shadow_strength)
 
-    # --- Reinhard color harmonization ---
+    # --- Ambient light: color-temperature match (chroma only, no luminance change) ---
+    if ambient_light:
+        result_arr = _ambient_light_match(result_arr, canvas_mask,
+                                          strength=ambient_strength)
+
+    # --- Reinhard color harmonization (full Lab: tone + color) ---
     if harmonize:
         result_arr = _reinhard_transfer(result_arr, canvas_mask)
 

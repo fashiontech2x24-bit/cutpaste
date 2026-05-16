@@ -246,12 +246,22 @@ _HTML = """<!DOCTYPE html>
         </label>
       </div>
       <div style="display:flex;align-items:center;gap:0.6rem;">
+        <input type="checkbox" id="inp-ambient" checked
+               style="width:16px;height:16px;accent-color:#7c3aed;cursor:pointer;"/>
+        <label for="inp-ambient" style="font-size:0.85rem;color:#e2e8f0;cursor:pointer;">
+          Ambient Light Match
+          <span style="color:#64748b;font-size:0.78rem;margin-left:0.3rem;">
+            — shifts person color temperature to match scene (chroma only, no brightness change)
+          </span>
+        </label>
+      </div>
+      <div style="display:flex;align-items:center;gap:0.6rem;">
         <input type="checkbox" id="inp-harmonize"
                style="width:16px;height:16px;accent-color:#7c3aed;cursor:pointer;"/>
         <label for="inp-harmonize" style="font-size:0.85rem;color:#e2e8f0;cursor:pointer;">
-          Color Harmonization
+          Full Color Harmonization
           <span style="color:#64748b;font-size:0.78rem;margin-left:0.3rem;">
-            — Reinhard Lab transfer: matches person tone to background
+            — Reinhard Lab transfer: matches person tone &amp; brightness to background
           </span>
         </label>
       </div>
@@ -326,7 +336,8 @@ _HTML = """<!DOCTYPE html>
     if (!files.portrait || !files.background) return;
     setLoading(true);
     const useShadow = document.getElementById('inp-shadow').checked;
-    setStatus('Running SAM3' + (useShadow ? ' + MiDaS depth…' : '…'), 'info');
+    const useAmbient = document.getElementById('inp-ambient').checked;
+    setStatus('Running SAM3' + (useShadow ? ' + MiDaS depth' : '') + (useAmbient ? ' + light match' : '') + '…', 'info');
     document.getElementById('result-card').style.display = 'none';
 
     const form = new FormData();
@@ -339,6 +350,7 @@ _HTML = """<!DOCTYPE html>
     form.append('foot_anchor',     document.getElementById('inp-foot').value / 100);
     form.append('shadow',          document.getElementById('inp-shadow').checked ? '1' : '0');
     form.append('shadow_strength', document.getElementById('inp-shadow-str').value);
+    form.append('ambient_light',   document.getElementById('inp-ambient').checked ? '1' : '0');
     form.append('harmonize',       document.getElementById('inp-harmonize').checked ? '1' : '0');
 
     try {
@@ -396,6 +408,7 @@ async def process(
     foot_anchor:     float = Form(0.87),
     shadow:          int   = Form(1),
     shadow_strength: float = Form(0.55),
+    ambient_light:   int   = Form(1),
     harmonize:       int   = Form(0),
 ):
     """
@@ -427,6 +440,7 @@ async def process(
                 foot_anchor=foot_anchor,
                 shadow=bool(shadow),
                 shadow_strength=shadow_strength,
+                ambient_light=bool(ambient_light),
                 harmonize=bool(harmonize),
             )
         except ValueError as exc:
