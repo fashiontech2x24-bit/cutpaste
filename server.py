@@ -226,6 +226,16 @@ _HTML = """<!DOCTYPE html>
         <input type="number" id="inp-conf" value="0.5" min="0.0" max="1.0" step="0.05"/>
       </div>
     </div>
+    <div style="margin-top:1rem;display:flex;align-items:center;gap:0.6rem;">
+      <input type="checkbox" id="inp-harmonize" checked
+             style="width:16px;height:16px;accent-color:#7c3aed;cursor:pointer;"/>
+      <label for="inp-harmonize" style="font-size:0.85rem;color:#e2e8f0;cursor:pointer;">
+        PCTNet Harmonization
+        <span style="color:#64748b;font-size:0.78rem;margin-left:0.3rem;">
+          — adjusts person lighting &amp; colors to match background
+        </span>
+      </label>
+    </div>
   </details>
 </div>
 
@@ -295,7 +305,8 @@ _HTML = """<!DOCTYPE html>
   async function processImages() {
     if (!files.portrait || !files.background) return;
     setLoading(true);
-    setStatus('Uploading & running SAM3 segmentation…', 'info');
+    const useHarm = document.getElementById('inp-harmonize').checked;
+    setStatus(useHarm ? 'Running SAM3 + PCTNet harmonization…' : 'Running SAM3 segmentation…', 'info');
     document.getElementById('result-card').style.display = 'none';
 
     const form = new FormData();
@@ -305,6 +316,7 @@ _HTML = """<!DOCTYPE html>
     form.append('confidence', document.getElementById('inp-conf').value);
     form.append('feather', document.getElementById('inp-feather').value);
     form.append('person_fill', document.getElementById('inp-fill').value / 100);
+    form.append('harmonize', document.getElementById('inp-harmonize').checked ? '1' : '0');
 
     try {
       const res = await fetch('/api/process', { method: 'POST', body: form });
@@ -358,6 +370,7 @@ async def process(
     confidence: float = Form(0.5),
     feather: float = Form(3.0),
     person_fill: float = Form(0.75),
+    harmonize: int = Form(1),
 ):
     """
     Segment the person from `portrait` using SAM3 and composite onto `background`.
@@ -385,6 +398,7 @@ async def process(
                 confidence_threshold=confidence,
                 feather_sigma=feather,
                 person_fill=person_fill,
+                harmonize=bool(harmonize),
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc))

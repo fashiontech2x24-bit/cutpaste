@@ -27,6 +27,9 @@ pip install torch==2.7.0 torchvision torchaudio --index-url https://download.pyt
 echo "Installing ML dependencies..."
 pip install "transformers>=5.0" huggingface_hub scipy pillow
 
+echo "Installing harmonization (libcom / PCTNet)..."
+pip install libcom
+
 echo "Installing server dependencies..."
 pip install fastapi uvicorn[standard] python-multipart
 
