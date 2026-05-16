@@ -1,92 +1,205 @@
 """
-Cut & Paste: Person Background Replacement using SAM3.
+Cut & Paste — MODNet + MiDaS pipeline.
+
+  MODNet  : portrait alpha matting  (~30ms, replaces SAM3)
+  MiDaS   : depth estimation        (~40ms, drives shadow generation)
 
 Pipeline:
-  1. SAM3 text-prompted segmentation → person mask
-  2. Gaussian edge feathering
-  3. Scale background to 768×1024 (cover-crop)
-  4. Scale person to person_fill % of frame height, alpha-composite
-  5. Reinhard color transfer — matches person's L*a*b* tone/lighting to background
+  1. MODNet  → clean alpha matte (hair/edge aware)
+  2. MiDaS  → depth map of background
+  3. Cover-crop background to 768×1024
+  4. Scale person to person_fill % of frame height
+  5. Alpha composite
+  6. Depth-driven drop shadow below feet
+  7. Optional Reinhard color harmonization
 """
 
+import os
+import sys
 import torch
 import numpy as np
 from PIL import Image
 from scipy.ndimage import gaussian_filter
 
-_sam_model = None
-_sam_processor = None
-
-MODEL_ID = "facebook/sam3"
 OUTPUT_W, OUTPUT_H = 768, 1024
 
+# MODNet repo cloned by setup.sh
+MODNET_REPO = os.environ.get("MODNET_REPO", "/workspace/MODNet")
+MODNET_CKPT = os.path.join(MODNET_REPO, "modnet_photographic_portrait_matting.ckpt")
 
-# ---------------------------------------------------------------------------
-# SAM3
-# ---------------------------------------------------------------------------
-
-def _load_sam(device="cuda"):
-    global _sam_model, _sam_processor
-    if _sam_model is not None:
-        return _sam_model, _sam_processor
-
-    from transformers import Sam3Model, Sam3Processor
-
-    print(f"Loading SAM3 from {MODEL_ID}...")
-    _sam_processor = Sam3Processor.from_pretrained(MODEL_ID)
-    _sam_model = Sam3Model.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16).to(device)
-    _sam_model.eval()
-    print("SAM3 loaded.")
-    return _sam_model, _sam_processor
-
-
-def _segment_person(image, prompt="person", confidence_threshold=0.5, device="cuda"):
-    model, processor = _load_sam(device)
-    inputs = processor(images=image, text=prompt, return_tensors="pt").to(device)
-
-    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-        outputs = model(**inputs)
-
-    results = processor.post_process_instance_segmentation(
-        outputs,
-        threshold=confidence_threshold,
-        mask_threshold=0.5,
-        target_sizes=inputs.get("original_sizes").tolist(),
-    )[0]
-
-    masks, scores = results["masks"], results["scores"]
-    if len(masks) == 0:
-        return None
-
-    best = scores.argmax().item()
-    return masks[best].cpu().numpy().astype(np.float32)
-
-
-def _feather_mask(mask, sigma=3.0):
-    return np.clip(gaussian_filter(mask, sigma=sigma), 0.0, 1.0)
+_modnet  = None
+_midas   = None
+_midas_t = None
 
 
 # ---------------------------------------------------------------------------
-# Reinhard color transfer
+# MODNet — portrait alpha matting
 # ---------------------------------------------------------------------------
-# Transfers the color statistics (mean + std per L*a*b* channel) from the
-# background region into the foreground (person), so their tone and lighting
-# appear consistent.  Pure numpy — no extra dependencies.
+
+def _load_modnet(device="cuda"):
+    global _modnet
+    if _modnet is not None:
+        return _modnet
+
+    if not os.path.exists(MODNET_CKPT):
+        raise FileNotFoundError(
+            f"MODNet weights not found at {MODNET_CKPT}. "
+            "Run setup.sh to download them."
+        )
+
+    repo_src = os.path.join(MODNET_REPO, "src")
+    if repo_src not in sys.path:
+        sys.path.insert(0, repo_src)
+
+    from models.modnet import MODNet
+
+    print("Loading MODNet...")
+    net = MODNet(backbone_pretrained=False)
+    ckpt = torch.load(MODNET_CKPT, map_location=device)
+    # Strip DataParallel 'module.' prefix if present
+    if any(k.startswith("module.") for k in ckpt.keys()):
+        ckpt = {k[7:]: v for k, v in ckpt.items()}
+    net.load_state_dict(ckpt)
+    net.to(device).eval()
+    _modnet = net
+    print("MODNet loaded.")
+    return _modnet
+
+
+def _matte_person(image: Image.Image, device="cuda") -> np.ndarray:
+    """
+    MODNet inference on a PIL RGB image.
+    Returns float32 alpha matte, same size as input, values 0.0-1.0.
+    """
+    from torchvision import transforms as T
+
+    model = _load_modnet(device)
+    orig_w, orig_h = image.size
+
+    # MODNet reference size: 512 on the longer side, dims must be mult of 32
+    ref = 512
+    if orig_w >= orig_h:
+        proc_h = ref
+        proc_w = int(orig_w * ref / orig_h)
+    else:
+        proc_w = ref
+        proc_h = int(orig_h * ref / orig_w)
+    proc_h = (proc_h // 32) * 32
+    proc_w = (proc_w // 32) * 32
+
+    tfm = T.Compose([
+        T.Resize((proc_h, proc_w)),
+        T.ToTensor(),
+        T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+    ])
+    img_t = tfm(image).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        _, _, matte = model(img_t, True)
+
+    matte_np = matte.squeeze().cpu().numpy()  # [0,1] float32
+    matte_pil = Image.fromarray((matte_np * 255).astype(np.uint8)).resize(
+        (orig_w, orig_h), Image.LANCZOS
+    )
+    return np.array(matte_pil).astype(np.float32) / 255.0
+
+
+# ---------------------------------------------------------------------------
+# MiDaS — monocular depth estimation (small variant, ~40ms)
+# ---------------------------------------------------------------------------
+
+def _load_midas(device="cuda"):
+    global _midas, _midas_t
+    if _midas is not None:
+        return _midas, _midas_t
+
+    print("Loading MiDaS small...")
+    _midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small", trust_repo=True)
+    _midas.to(device).eval()
+    _midas_t = torch.hub.load("intel-isl/MiDaS", "transforms",
+                               trust_repo=True).small_transform
+    print("MiDaS loaded.")
+    return _midas, _midas_t
+
+
+def _estimate_depth(image: Image.Image, device="cuda") -> np.ndarray:
+    """
+    MiDaS depth map, resized to image dimensions.
+    Returns float32 [0,1] where 1.0 = closest to camera.
+    """
+    model, transform = _load_midas(device)
+    img_np = np.array(image)
+    batch  = transform(img_np).to(device)
+
+    with torch.no_grad():
+        depth = model(batch)
+        depth = torch.nn.functional.interpolate(
+            depth.unsqueeze(1),
+            size=img_np.shape[:2],
+            mode="bicubic",
+            align_corners=False,
+        ).squeeze()
+
+    d = depth.cpu().numpy().astype(np.float32)
+    d = (d - d.min()) / (d.max() - d.min() + 1e-8)
+    return d
+
+
+# ---------------------------------------------------------------------------
+# Shadow generation (depth-aware)
+# ---------------------------------------------------------------------------
+
+def _add_shadow(result_arr, canvas_mask, bg_depth, x_off, y_off,
+                new_w, new_h, shadow_strength=0.55):
+    """
+    Cast an elliptical drop shadow below the person's feet.
+    Shadow opacity is scaled by the background depth at that point —
+    darker/larger when ground is close, lighter/smaller when far away.
+    """
+    # Foot position = bottom center of person bounding box
+    foot_y = min(y_off + new_h, OUTPUT_H - 1)
+    foot_x = x_off + new_w // 2
+
+    # Sample background depth at foot position (clamp to valid range)
+    sample_y = min(foot_y + 5, OUTPUT_H - 1)
+    ground_depth = bg_depth[sample_y, foot_x]  # 0=far, 1=close
+
+    # Shadow ellipse dimensions — scale with person width and depth
+    sw = int(new_w * 0.55)
+    sh = max(int(sw * 0.18 * (0.4 + ground_depth * 0.6)), 4)
+    opacity = shadow_strength * (0.3 + ground_depth * 0.7)
+
+    # Build shadow mask (smooth ellipse)
+    cy, cx = foot_y, foot_x
+    Y, X = np.ogrid[:OUTPUT_H, :OUTPUT_W]
+    dist = ((X - cx) / (sw + 1e-6)) ** 2 + ((Y - cy) / (sh + 1e-6)) ** 2
+    shadow = np.clip(1.0 - dist, 0.0, 1.0)
+    shadow = gaussian_filter(shadow, sigma=sh * 0.6)
+    shadow = shadow / (shadow.max() + 1e-8)
+
+    # Don't draw shadow behind the solid person (mask > 0.7)
+    shadow = shadow * (1.0 - np.clip(canvas_mask - 0.7, 0, 0.3) / 0.3)
+    shadow = shadow[..., np.newaxis] * opacity
+
+    result_arr = result_arr.copy()
+    result_arr = result_arr * (1.0 - shadow)
+    return result_arr
+
+
+# ---------------------------------------------------------------------------
+# Reinhard Lab color harmonization (mean-shift only, safe for flat BGs)
+# ---------------------------------------------------------------------------
 
 def _rgb_to_lab(img_f32):
-    """float32 RGB [0,1] → L*a*b* (OpenCV-style, float32)."""
-    # sRGB → linear
-    mask = img_f32 > 0.04045
+    mask   = img_f32 > 0.04045
     linear = np.where(mask, ((img_f32 + 0.055) / 1.055) ** 2.4, img_f32 / 12.92)
-    # linear RGB → XYZ (D65)
     M = np.array([[0.4124564, 0.3575761, 0.1804375],
                   [0.2126729, 0.7151522, 0.0721750],
                   [0.0193339, 0.1191920, 0.9503041]], dtype=np.float32)
     xyz = linear @ M.T
-    # XYZ → L*a*b*
     xyz /= np.array([0.95047, 1.00000, 1.08883], dtype=np.float32)
     eps = 0.008856
-    xyz = np.where(xyz > eps, np.cbrt(xyz), (7.787 * xyz) + (16 / 116))
+    xyz = np.where(xyz > eps, np.cbrt(xyz), 7.787 * xyz + 16 / 116)
     L = 116 * xyz[..., 1] - 16
     a = 500 * (xyz[..., 0] - xyz[..., 1])
     b = 200 * (xyz[..., 1] - xyz[..., 2])
@@ -94,147 +207,133 @@ def _rgb_to_lab(img_f32):
 
 
 def _lab_to_rgb(lab):
-    """L*a*b* float32 → float32 RGB [0,1]."""
     fy = (lab[..., 0] + 16) / 116
     fx = lab[..., 1] / 500 + fy
     fz = fy - lab[..., 2] / 200
     eps = 0.008856
     xyz = np.stack([
-        np.where(fx ** 3 > eps, fx ** 3, (fx - 16 / 116) / 7.787),
-        np.where(fy ** 3 > eps, fy ** 3, (fy - 16 / 116) / 7.787),
-        np.where(fz ** 3 > eps, fz ** 3, (fz - 16 / 116) / 7.787),
+        np.where(fx**3 > eps, fx**3, (fx - 16/116) / 7.787),
+        np.where(fy**3 > eps, fy**3, (fy - 16/116) / 7.787),
+        np.where(fz**3 > eps, fz**3, (fz - 16/116) / 7.787),
     ], axis=-1)
     xyz *= np.array([0.95047, 1.00000, 1.08883], dtype=np.float32)
     M_inv = np.array([[ 3.2404542, -1.5371385, -0.4985314],
                       [-0.9692660,  1.8760108,  0.0415560],
                       [ 0.0556434, -0.2040259,  1.0572252]], dtype=np.float32)
-    linear = xyz @ M_inv.T
-    linear = np.clip(linear, 0.0, None)
+    linear = np.clip(xyz @ M_inv.T, 0.0, None)
     rgb = np.where(linear > 0.0031308,
-                   1.055 * np.power(linear, 1 / 2.4) - 0.055,
+                   1.055 * np.power(linear, 1/2.4) - 0.055,
                    12.92 * linear)
     return np.clip(rgb, 0.0, 1.0)
 
 
 def _reinhard_transfer(composite_arr, canvas_mask, strength=0.35):
-    """
-    Gently shift the person's L*a*b* mean toward the background's mean.
-
-    composite_arr: float32 RGB [0,255] — full composited canvas
-    canvas_mask:   float32 [0,1]       — person mask on canvas
-    strength:      0.0 = no effect, 1.0 = full transfer (default 0.35)
-
-    Only the mean is transferred (no std scaling) to prevent color collapse
-    when the background is near-uniform.
-    """
     img = composite_arr / 255.0
     lab = _rgb_to_lab(img)
-
-    fg = canvas_mask > 0.5   # solid person pixels
-    bg = canvas_mask < 0.1   # solid background pixels
-
+    fg  = canvas_mask > 0.5
+    bg  = canvas_mask < 0.1
     if fg.sum() < 100 or bg.sum() < 100:
-        return composite_arr  # not enough pixels to sample — skip
-
+        return composite_arr
     result_lab = lab.copy()
     for ch in range(3):
-        src_vals = lab[..., ch][fg]
-        tgt_vals = lab[..., ch][bg]
-
-        # Only shift the mean — do NOT scale by std ratio.
-        # Scaling by tgt.std/src.std washes out the person when
-        # the background is near-uniform (tgt.std ≈ 0).
-        mean_shift = tgt_vals.mean() - src_vals.mean()
-
-        # Blend: don't fully drag person to background, just nudge it
-        result_lab[..., ch][fg] = src_vals + mean_shift * strength
-
-    result_rgb = _lab_to_rgb(result_lab)
-    return np.clip(result_rgb * 255.0, 0, 255).astype(np.float32)
+        src = lab[..., ch][fg]
+        tgt = lab[..., ch][bg]
+        result_lab[..., ch][fg] = src + (tgt.mean() - src.mean()) * strength
+    return np.clip(_lab_to_rgb(result_lab) * 255.0, 0, 255).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
-# Main function
+# Main API
 # ---------------------------------------------------------------------------
 
 def replace_background(
     portrait_path,
     background_path,
     output_path,
-    prompt="person",
-    confidence_threshold=0.5,
-    feather_sigma=3.0,
     person_fill=0.75,
     harmonize=False,
+    shadow=True,
+    shadow_strength=0.55,
     device="cuda",
 ):
     """
-    Segment person from portrait_path, composite onto background_path,
-    then optionally harmonize colors via Reinhard Lab transfer.
+    Composite a person onto a new background using MODNet + MiDaS.
 
     Args:
-        portrait_path:        Source portrait image path.
-        background_path:      New background image path.
-        output_path:          Where to save the result PNG.
-        prompt:               SAM3 text prompt (default: "person").
-        confidence_threshold: Min SAM3 confidence for mask selection.
-        feather_sigma:        Gaussian blur sigma for edge feathering.
-        person_fill:          Person height as fraction of OUTPUT_H (default 0.75).
-        harmonize:            Run Reinhard color transfer after compositing.
-        device:               Torch device ("cuda" or "cpu").
+        portrait_path:    Source portrait image path.
+        background_path:  New background image path.
+        output_path:      Where to save the 768×1024 result PNG.
+        person_fill:      Person height as fraction of OUTPUT_H (default 0.75).
+        harmonize:        Apply Reinhard color shift (default False).
+        shadow:           Render depth-aware drop shadow (default True).
+        shadow_strength:  Shadow opacity 0-1 (default 0.55).
+        device:           Torch device string ("cuda" or "cpu").
     """
     portrait   = Image.open(portrait_path).convert("RGB")
     background = Image.open(background_path).convert("RGB")
 
-    # Background → cover-crop to OUTPUT_W × OUTPUT_H
-    bg_w, bg_h   = background.size
-    cover        = max(OUTPUT_W / bg_w, OUTPUT_H / bg_h)
-    bg_sw, bg_sh = int(bg_w * cover), int(bg_h * cover)
-    background   = background.resize((bg_sw, bg_sh), Image.LANCZOS)
-    cx, cy       = (bg_sw - OUTPUT_W) // 2, (bg_sh - OUTPUT_H) // 2
-    background   = background.crop((cx, cy, cx + OUTPUT_W, cy + OUTPUT_H))
+    # --- MODNet: alpha matte ---
+    matte = _matte_person(portrait, device=device)  # float32 [0,1], portrait size
 
-    # Segment
-    mask = _segment_person(portrait, prompt=prompt,
-                           confidence_threshold=confidence_threshold, device=device)
-    if mask is None:
-        raise ValueError(f"No '{prompt}' detected above threshold {confidence_threshold}")
+    # --- MiDaS: background depth map ---
+    if shadow:
+        bg_depth = _estimate_depth(background, device=device)  # float32 [0,1]
+    else:
+        bg_depth = None
 
-    mask = _feather_mask(mask, sigma=feather_sigma)
+    # --- Background: cover-crop to 768×1024 ---
+    bg_w, bg_h = background.size
+    cover      = max(OUTPUT_W / bg_w, OUTPUT_H / bg_h)
+    bg_sw      = int(bg_w * cover)
+    bg_sh      = int(bg_h * cover)
+    background = background.resize((bg_sw, bg_sh), Image.LANCZOS)
+    cx, cy     = (bg_sw - OUTPUT_W) // 2, (bg_sh - OUTPUT_H) // 2
+    background = background.crop((cx, cy, cx + OUTPUT_W, cy + OUTPUT_H))
+    if bg_depth is not None:
+        bg_depth_pil = Image.fromarray((bg_depth * 255).astype(np.uint8)).resize(
+            (bg_sw, bg_sh), Image.BILINEAR
+        ).crop((cx, cy, cx + OUTPUT_W, cy + OUTPUT_H))
+        bg_depth = np.array(bg_depth_pil).astype(np.float32) / 255.0
 
-    # Scale person: height = person_fill × OUTPUT_H, width clamped to OUTPUT_W
+    # --- Scale person: height = person_fill × OUTPUT_H ---
     p_w, p_h  = portrait.size
     fit_scale = min(OUTPUT_W / p_w, OUTPUT_H * person_fill / p_h)
     new_w     = int(p_w * fit_scale)
     new_h     = int(p_h * fit_scale)
 
-    portrait_resized = portrait.resize((new_w, new_h), Image.LANCZOS)
-    mask_resized = np.array(
-        Image.fromarray((mask * 255).astype(np.uint8)).resize((new_w, new_h), Image.LANCZOS)
+    portrait_r = portrait.resize((new_w, new_h), Image.LANCZOS)
+    matte_r    = np.array(
+        Image.fromarray((matte * 255).astype(np.uint8)).resize(
+            (new_w, new_h), Image.LANCZOS
+        )
     ).astype(np.float32) / 255.0
 
-    # Center on canvas
+    # --- Center on canvas ---
     x_off = (OUTPUT_W - new_w) // 2
     y_off = (OUTPUT_H - new_h) // 2
 
-    # Build canvas-sized mask for harmonization
+    # --- Canvas mask (full 768×1024) ---
     canvas_mask = np.zeros((OUTPUT_H, OUTPUT_W), dtype=np.float32)
-    canvas_mask[y_off : y_off + new_h, x_off : x_off + new_w] = mask_resized
+    canvas_mask[y_off : y_off + new_h, x_off : x_off + new_w] = matte_r
 
-    # Alpha composite
-    result_arr  = np.array(background).astype(np.float32)
-    person_arr  = np.array(portrait_resized).astype(np.float32)
-    alpha       = mask_resized[..., np.newaxis]
-    region      = result_arr[y_off : y_off + new_h, x_off : x_off + new_w]
-    result_arr[y_off : y_off + new_h, x_off : x_off + new_w] = (
+    # --- Alpha composite ---
+    result     = np.array(background).astype(np.float32)
+    person_arr = np.array(portrait_r).astype(np.float32)
+    alpha      = matte_r[..., np.newaxis]
+    region     = result[y_off : y_off + new_h, x_off : x_off + new_w]
+    result[y_off : y_off + new_h, x_off : x_off + new_w] = (
         person_arr * alpha + region * (1.0 - alpha)
     )
 
-    # Reinhard color harmonization
-    if harmonize:
-        result_arr = _reinhard_transfer(result_arr, canvas_mask)
+    # --- Depth-aware shadow ---
+    if shadow and bg_depth is not None:
+        result = _add_shadow(result, canvas_mask, bg_depth,
+                             x_off, y_off, new_w, new_h, shadow_strength)
 
-    Image.fromarray(result_arr.astype(np.uint8)).save(output_path)
-    label = "harmonized" if harmonize else "composited"
-    print(f"Saved {OUTPUT_W}×{OUTPUT_H} {label} image → {output_path}")
+    # --- Color harmonization ---
+    if harmonize:
+        result = _reinhard_transfer(result, canvas_mask)
+
+    Image.fromarray(result.astype(np.uint8)).save(output_path)
+    print(f"Saved {OUTPUT_W}×{OUTPUT_H} → {output_path}")
     return output_path

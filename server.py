@@ -210,31 +210,35 @@ _HTML = """<!DOCTYPE html>
     </summary>
     <div class="settings-grid" style="margin-top:0.5rem;">
       <div>
-        <label class="field-label" for="inp-prompt">Segmentation Prompt</label>
-        <input type="text" id="inp-prompt" value="person" placeholder="person"/>
-      </div>
-      <div>
         <label class="field-label" for="inp-fill">Person Fill (% of frame height)</label>
         <input type="number" id="inp-fill" value="75" min="10" max="100" step="5"/>
       </div>
       <div>
-        <label class="field-label" for="inp-feather">Edge Feather (σ)</label>
-        <input type="number" id="inp-feather" value="3.0" min="0.0" max="20.0" step="0.5"/>
-      </div>
-      <div>
-        <label class="field-label" for="inp-conf">Confidence Threshold</label>
-        <input type="number" id="inp-conf" value="0.5" min="0.0" max="1.0" step="0.05"/>
+        <label class="field-label" for="inp-shadow-str">Shadow Strength</label>
+        <input type="number" id="inp-shadow-str" value="0.55" min="0.0" max="1.0" step="0.05"/>
       </div>
     </div>
-    <div style="margin-top:1rem;display:flex;align-items:center;gap:0.6rem;">
-      <input type="checkbox" id="inp-harmonize"
-             style="width:16px;height:16px;accent-color:#7c3aed;cursor:pointer;"/>
-      <label for="inp-harmonize" style="font-size:0.85rem;color:#e2e8f0;cursor:pointer;">
-        Color Harmonization
-        <span style="color:#64748b;font-size:0.78rem;margin-left:0.3rem;">
-          — Reinhard Lab transfer: matches person tone &amp; lighting to background
-        </span>
-      </label>
+    <div style="margin-top:1rem;display:flex;flex-direction:column;gap:0.6rem;">
+      <div style="display:flex;align-items:center;gap:0.6rem;">
+        <input type="checkbox" id="inp-shadow" checked
+               style="width:16px;height:16px;accent-color:#7c3aed;cursor:pointer;"/>
+        <label for="inp-shadow" style="font-size:0.85rem;color:#e2e8f0;cursor:pointer;">
+          Depth Shadow
+          <span style="color:#64748b;font-size:0.78rem;margin-left:0.3rem;">
+            — MiDaS depth-driven drop shadow below feet
+          </span>
+        </label>
+      </div>
+      <div style="display:flex;align-items:center;gap:0.6rem;">
+        <input type="checkbox" id="inp-harmonize"
+               style="width:16px;height:16px;accent-color:#7c3aed;cursor:pointer;"/>
+        <label for="inp-harmonize" style="font-size:0.85rem;color:#e2e8f0;cursor:pointer;">
+          Color Harmonization
+          <span style="color:#64748b;font-size:0.78rem;margin-left:0.3rem;">
+            — Reinhard Lab transfer: matches person tone to background
+          </span>
+        </label>
+      </div>
     </div>
   </details>
 </div>
@@ -305,17 +309,17 @@ _HTML = """<!DOCTYPE html>
   async function processImages() {
     if (!files.portrait || !files.background) return;
     setLoading(true);
-    const useHarm = document.getElementById('inp-harmonize').checked;
-    setStatus(useHarm ? 'Running SAM3 + color harmonization…' : 'Running SAM3 segmentation…', 'info');
+    const useHarm   = document.getElementById('inp-harmonize').checked;
+    const useShadow = document.getElementById('inp-shadow').checked;
+    setStatus('Running MODNet matting' + (useShadow ? ' + MiDaS depth…' : '…'), 'info');
     document.getElementById('result-card').style.display = 'none';
 
     const form = new FormData();
     form.append('portrait', files.portrait);
     form.append('background', files.background);
-    form.append('prompt', document.getElementById('inp-prompt').value || 'person');
-    form.append('confidence', document.getElementById('inp-conf').value);
-    form.append('feather', document.getElementById('inp-feather').value);
     form.append('person_fill', document.getElementById('inp-fill').value / 100);
+    form.append('shadow', document.getElementById('inp-shadow').checked ? '1' : '0');
+    form.append('shadow_strength', document.getElementById('inp-shadow-str').value);
     form.append('harmonize', document.getElementById('inp-harmonize').checked ? '1' : '0');
 
     try {
@@ -366,11 +370,10 @@ async def ui():
 async def process(
     portrait: UploadFile = File(..., description="Portrait/person image"),
     background: UploadFile = File(..., description="New background image"),
-    prompt: str = Form("person"),
-    confidence: float = Form(0.5),
-    feather: float = Form(3.0),
-    person_fill: float = Form(0.75),
-    harmonize: int = Form(1),
+    person_fill:     float = Form(0.75),
+    shadow:          int   = Form(1),
+    shadow_strength: float = Form(0.55),
+    harmonize:       int   = Form(0),
 ):
     """
     Segment the person from `portrait` using SAM3 and composite onto `background`.
@@ -394,10 +397,9 @@ async def process(
                 str(portrait_path),
                 str(background_path),
                 str(output_path),
-                prompt=prompt,
-                confidence_threshold=confidence,
-                feather_sigma=feather,
                 person_fill=person_fill,
+                shadow=bool(shadow),
+                shadow_strength=shadow_strength,
                 harmonize=bool(harmonize),
             )
         except ValueError as exc:
