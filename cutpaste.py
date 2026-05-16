@@ -265,7 +265,7 @@ def replace_background(
     confidence_threshold=0.5,
     erode_px=4,
     feather_sigma=3.0,
-    person_fill=0.75,
+    person_fill=0.82,
     foot_anchor=0.87,
     shadow=True,
     shadow_strength=0.55,
@@ -320,10 +320,11 @@ def replace_background(
     ground_depth = float(bg_depth[py0:py1, px0:px1].mean())  # 0=far, 1=close
 
     # --- Depth-aware scale ---
-    # person_fill sets max height. Scale up/down by ground depth so
-    # a close ground (depth≈1) gives a larger person, far ground (depth≈0) smaller.
-    depth_scale = 0.65 + ground_depth * 0.7   # range ~0.65–1.35
-    effective_fill = np.clip(person_fill * depth_scale, 0.3, 1.0)
+    # person_fill is the intended height.  Depth nudges ±12% — flat/far backgrounds
+    # used to collapse the range to 0.65×, making the person tiny.  Keep it tight
+    # so person_fill is always close to what the user asked for.
+    depth_scale = 0.90 + ground_depth * 0.22   # range 0.90–1.12
+    effective_fill = np.clip(person_fill * depth_scale, 0.4, 1.0)
 
     p_w, p_h  = portrait.size
     fit_scale = min(OUTPUT_W / p_w, OUTPUT_H * effective_fill / p_h)
