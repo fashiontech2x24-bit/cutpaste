@@ -1,12 +1,12 @@
 """
-Cut & Paste: Person Background Replacement using SAM3 + PCTNet harmonization.
+Cut & Paste: Person Background Replacement using SAM3.
 
 Pipeline:
   1. SAM3 text-prompted segmentation → person mask
   2. Gaussian edge feathering
   3. Scale background to 768×1024 (cover-crop)
   4. Scale person to person_fill % of frame height, alpha-composite
-  5. PCTNet harmonization → adjusts person colors/lighting to match background
+  5. Reinhard color transfer — matches person's L*a*b* tone/lighting to background
 """
 
 import torch
@@ -14,15 +14,16 @@ import numpy as np
 from PIL import Image
 from scipy.ndimage import gaussian_filter
 
-# Cached model globals
 _sam_model = None
 _sam_processor = None
-_harm_model = None
 
 MODEL_ID = "facebook/sam3"
+OUTPUT_W, OUTPUT_H = 768, 1024
 
-OUTPUT_W, OUTPUT_H = 768, 1024  # standard output canvas (portrait 3:4)
 
+# ---------------------------------------------------------------------------
+# SAM3
+# ---------------------------------------------------------------------------
 
 def _load_sam(device="cuda"):
     global _sam_model, _sam_processor
@@ -39,24 +40,8 @@ def _load_sam(device="cuda"):
     return _sam_model, _sam_processor
 
 
-def _load_harmonizer(device="cuda"):
-    global _harm_model
-    if _harm_model is not None:
-        return _harm_model
-
-    from libcom import ImageHarmonizationModel
-
-    gpu_index = 0 if device == "cuda" else "cpu"
-    print("Loading PCTNet harmonization model...")
-    _harm_model = ImageHarmonizationModel(device=gpu_index, model_type="PCTNet")
-    print("PCTNet loaded.")
-    return _harm_model
-
-
 def _segment_person(image, prompt="person", confidence_threshold=0.5, device="cuda"):
-    """Run SAM3 text-prompted segmentation; returns best float32 mask or None."""
     model, processor = _load_sam(device)
-
     inputs = processor(images=image, text=prompt, return_tensors="pt").to(device)
 
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
@@ -69,20 +54,102 @@ def _segment_person(image, prompt="person", confidence_threshold=0.5, device="cu
         target_sizes=inputs.get("original_sizes").tolist(),
     )[0]
 
-    masks = results["masks"]
-    scores = results["scores"]
-
+    masks, scores = results["masks"], results["scores"]
     if len(masks) == 0:
         return None
 
-    best_idx = scores.argmax().item()
-    return masks[best_idx].cpu().numpy().astype(np.float32)
+    best = scores.argmax().item()
+    return masks[best].cpu().numpy().astype(np.float32)
 
 
 def _feather_mask(mask, sigma=3.0):
-    """Gaussian feathering on mask edges for smooth compositing."""
     return np.clip(gaussian_filter(mask, sigma=sigma), 0.0, 1.0)
 
+
+# ---------------------------------------------------------------------------
+# Reinhard color transfer
+# ---------------------------------------------------------------------------
+# Transfers the color statistics (mean + std per L*a*b* channel) from the
+# background region into the foreground (person), so their tone and lighting
+# appear consistent.  Pure numpy — no extra dependencies.
+
+def _rgb_to_lab(img_f32):
+    """float32 RGB [0,1] → L*a*b* (OpenCV-style, float32)."""
+    # sRGB → linear
+    mask = img_f32 > 0.04045
+    linear = np.where(mask, ((img_f32 + 0.055) / 1.055) ** 2.4, img_f32 / 12.92)
+    # linear RGB → XYZ (D65)
+    M = np.array([[0.4124564, 0.3575761, 0.1804375],
+                  [0.2126729, 0.7151522, 0.0721750],
+                  [0.0193339, 0.1191920, 0.9503041]], dtype=np.float32)
+    xyz = linear @ M.T
+    # XYZ → L*a*b*
+    xyz /= np.array([0.95047, 1.00000, 1.08883], dtype=np.float32)
+    eps = 0.008856
+    xyz = np.where(xyz > eps, np.cbrt(xyz), (7.787 * xyz) + (16 / 116))
+    L = 116 * xyz[..., 1] - 16
+    a = 500 * (xyz[..., 0] - xyz[..., 1])
+    b = 200 * (xyz[..., 1] - xyz[..., 2])
+    return np.stack([L, a, b], axis=-1)
+
+
+def _lab_to_rgb(lab):
+    """L*a*b* float32 → float32 RGB [0,1]."""
+    fy = (lab[..., 0] + 16) / 116
+    fx = lab[..., 1] / 500 + fy
+    fz = fy - lab[..., 2] / 200
+    eps = 0.008856
+    xyz = np.stack([
+        np.where(fx ** 3 > eps, fx ** 3, (fx - 16 / 116) / 7.787),
+        np.where(fy ** 3 > eps, fy ** 3, (fy - 16 / 116) / 7.787),
+        np.where(fz ** 3 > eps, fz ** 3, (fz - 16 / 116) / 7.787),
+    ], axis=-1)
+    xyz *= np.array([0.95047, 1.00000, 1.08883], dtype=np.float32)
+    M_inv = np.array([[ 3.2404542, -1.5371385, -0.4985314],
+                      [-0.9692660,  1.8760108,  0.0415560],
+                      [ 0.0556434, -0.2040259,  1.0572252]], dtype=np.float32)
+    linear = xyz @ M_inv.T
+    linear = np.clip(linear, 0.0, None)
+    rgb = np.where(linear > 0.0031308,
+                   1.055 * np.power(linear, 1 / 2.4) - 0.055,
+                   12.92 * linear)
+    return np.clip(rgb, 0.0, 1.0)
+
+
+def _reinhard_transfer(person_arr, background_arr, person_mask):
+    """
+    Adjust person colors so its L*a*b* statistics match the background.
+
+    person_arr, background_arr: float32 RGB [0,255]
+    person_mask: float32 [0,1] on the canvas (same H×W as the arrays)
+    Returns adjusted person_arr (float32 RGB [0,255]).
+    """
+    p = person_arr / 255.0
+    bg = background_arr / 255.0
+
+    p_lab  = _rgb_to_lab(p)
+    bg_lab = _rgb_to_lab(bg)
+
+    fg_pixels = person_mask > 0.5                      # boolean mask
+    bg_pixels = person_mask < 0.1
+
+    result_lab = p_lab.copy()
+    for ch in range(3):
+        src = p_lab[..., ch][fg_pixels]
+        tgt = bg_lab[..., ch][bg_pixels]
+        if src.std() < 1e-6 or tgt.std() < 1e-6:
+            continue
+        # shift person channel to match background mean/std
+        adjusted = (src - src.mean()) * (tgt.std() / src.std()) + tgt.mean()
+        result_lab[..., ch][fg_pixels] = adjusted
+
+    result_rgb = _lab_to_rgb(result_lab)
+    return (result_rgb * 255.0).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Main function
+# ---------------------------------------------------------------------------
 
 def replace_background(
     portrait_path,
@@ -97,7 +164,7 @@ def replace_background(
 ):
     """
     Segment person from portrait_path, composite onto background_path,
-    then optionally harmonize colors/lighting with PCTNet.
+    then optionally harmonize colors via Reinhard Lab transfer.
 
     Args:
         portrait_path:        Source portrait image path.
@@ -106,76 +173,62 @@ def replace_background(
         prompt:               SAM3 text prompt (default: "person").
         confidence_threshold: Min SAM3 confidence for mask selection.
         feather_sigma:        Gaussian blur sigma for edge feathering.
-        person_fill:          Person height as fraction of OUTPUT_H (default 0.75 = 75%).
-        harmonize:            Run PCTNet harmonization after compositing (default True).
-        device:               Torch device string ("cuda" or "cpu").
-
-    Returns:
-        Path to the saved output image.
+        person_fill:          Person height as fraction of OUTPUT_H (default 0.75).
+        harmonize:            Run Reinhard color transfer after compositing.
+        device:               Torch device ("cuda" or "cpu").
     """
-    portrait = Image.open(portrait_path).convert("RGB")
+    portrait   = Image.open(portrait_path).convert("RGB")
     background = Image.open(background_path).convert("RGB")
 
-    # --- Background: scale-to-cover then center-crop to OUTPUT_W × OUTPUT_H ---
-    bg_w, bg_h = background.size
-    cover_scale = max(OUTPUT_W / bg_w, OUTPUT_H / bg_h)
-    bg_sw = int(bg_w * cover_scale)
-    bg_sh = int(bg_h * cover_scale)
-    background = background.resize((bg_sw, bg_sh), Image.LANCZOS)
-    cx = (bg_sw - OUTPUT_W) // 2
-    cy = (bg_sh - OUTPUT_H) // 2
-    background = background.crop((cx, cy, cx + OUTPUT_W, cy + OUTPUT_H))
+    # Background → cover-crop to OUTPUT_W × OUTPUT_H
+    bg_w, bg_h   = background.size
+    cover        = max(OUTPUT_W / bg_w, OUTPUT_H / bg_h)
+    bg_sw, bg_sh = int(bg_w * cover), int(bg_h * cover)
+    background   = background.resize((bg_sw, bg_sh), Image.LANCZOS)
+    cx, cy       = (bg_sw - OUTPUT_W) // 2, (bg_sh - OUTPUT_H) // 2
+    background   = background.crop((cx, cy, cx + OUTPUT_W, cy + OUTPUT_H))
 
-    # --- Segmentation ---
-    mask = _segment_person(portrait, prompt=prompt, confidence_threshold=confidence_threshold, device=device)
+    # Segment
+    mask = _segment_person(portrait, prompt=prompt,
+                           confidence_threshold=confidence_threshold, device=device)
     if mask is None:
-        raise ValueError(f"No '{prompt}' detected in {portrait_path} above threshold {confidence_threshold}")
+        raise ValueError(f"No '{prompt}' detected above threshold {confidence_threshold}")
 
     mask = _feather_mask(mask, sigma=feather_sigma)
 
-    # --- Scale person: height = person_fill × OUTPUT_H, width clamped to OUTPUT_W ---
-    p_w, p_h = portrait.size
+    # Scale person: height = person_fill × OUTPUT_H, width clamped to OUTPUT_W
+    p_w, p_h  = portrait.size
     fit_scale = min(OUTPUT_W / p_w, OUTPUT_H * person_fill / p_h)
-    new_w = int(p_w * fit_scale)
-    new_h = int(p_h * fit_scale)
+    new_w     = int(p_w * fit_scale)
+    new_h     = int(p_h * fit_scale)
 
     portrait_resized = portrait.resize((new_w, new_h), Image.LANCZOS)
     mask_resized = np.array(
         Image.fromarray((mask * 255).astype(np.uint8)).resize((new_w, new_h), Image.LANCZOS)
     ).astype(np.float32) / 255.0
 
-    # --- Center person on canvas ---
+    # Center on canvas
     x_off = (OUTPUT_W - new_w) // 2
     y_off = (OUTPUT_H - new_h) // 2
 
-    # --- Alpha composite ---
-    result_arr = np.array(background).astype(np.float32)
-    portrait_arr = np.array(portrait_resized).astype(np.float32)
-    alpha = mask_resized[..., np.newaxis]
-    region = result_arr[y_off : y_off + new_h, x_off : x_off + new_w]
+    # Build canvas-sized mask for harmonization
+    canvas_mask = np.zeros((OUTPUT_H, OUTPUT_W), dtype=np.float32)
+    canvas_mask[y_off : y_off + new_h, x_off : x_off + new_w] = mask_resized
+
+    # Alpha composite
+    result_arr  = np.array(background).astype(np.float32)
+    person_arr  = np.array(portrait_resized).astype(np.float32)
+    alpha       = mask_resized[..., np.newaxis]
+    region      = result_arr[y_off : y_off + new_h, x_off : x_off + new_w]
     result_arr[y_off : y_off + new_h, x_off : x_off + new_w] = (
-        portrait_arr * alpha + region * (1.0 - alpha)
+        person_arr * alpha + region * (1.0 - alpha)
     )
 
-    # --- PCTNet harmonization ---
-    # Adjusts the person's colors and lighting to match the background scene.
-    # libcom expects BGR uint8 composite + uint8 mask (255 = foreground).
+    # Reinhard color harmonization
     if harmonize:
-        harmonizer = _load_harmonizer(device)
+        result_arr = _reinhard_transfer(result_arr, result_arr.copy(), canvas_mask)
 
-        composite_bgr = result_arr.astype(np.uint8)[..., ::-1].copy()
-
-        canvas_mask = np.zeros((OUTPUT_H, OUTPUT_W), dtype=np.uint8)
-        canvas_mask[y_off : y_off + new_h, x_off : x_off + new_w] = (
-            (mask_resized * 255).astype(np.uint8)
-        )
-
-        harmonized_bgr = harmonizer(composite_bgr, canvas_mask)
-        result_arr = harmonized_bgr[..., ::-1].astype(np.float32)  # back to RGB
-
-    result = Image.fromarray(result_arr.astype(np.uint8))
-    result.save(output_path)
+    Image.fromarray(result_arr.astype(np.uint8)).save(output_path)
     label = "harmonized" if harmonize else "composited"
-    print(f"Saved {OUTPUT_W}×{OUTPUT_H} {label} image to {output_path}")
-
+    print(f"Saved {OUTPUT_W}×{OUTPUT_H} {label} image → {output_path}")
     return output_path

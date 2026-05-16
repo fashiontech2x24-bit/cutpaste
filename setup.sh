@@ -2,41 +2,22 @@
 set -e
 
 echo "=== Cut & Paste: SAM3 Background Replacement Setup ==="
+echo "    Environment: Vast.AI Docker, Python 3.10, CUDA 13"
 echo ""
 
-# Requirements:
-#   - Python 3.12+
-#   - CUDA 12.6+ (driver 560+)
-#   - ~16GB+ GPU VRAM recommended (model is ~6.9GB in bf16)
-
-# Create conda env if it doesn't exist
-if ! conda env list | grep -q "^sam3 "; then
-    echo "Creating conda environment 'sam3' with Python 3.12..."
-    conda create -n sam3 python=3.12 -y
-else
-    echo "Conda environment 'sam3' already exists."
-fi
-
-echo "Activating sam3 environment..."
-eval "$(conda shell.bash hook)"
-conda activate sam3
-
-echo "Installing PyTorch 2.7.0 (CUDA 12.6)..."
+# PyTorch CUDA 12.6 builds run fine on CUDA 13 (NVIDIA backward compatible)
+echo "Installing PyTorch 2.7.0 (cu126 — works on CUDA 13)..."
 pip install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 
-echo "Installing ML dependencies..."
-pip install "transformers>=5.0" huggingface_hub scipy pillow
-
-echo "Installing harmonization (libcom / PCTNet)..."
-# libcom uses git submodules for LBM source code which pip install git+ doesn't fetch.
-# Must clone with --recurse-submodules then install from local path.
-# --no-deps skips mmpose/mmdet which have broken build scripts.
-git clone --recurse-submodules https://github.com/bcmi/libcom.git /tmp/libcom_src
-pip install -e /tmp/libcom_src --no-deps
-pip install lpips timm einops diffusers==0.34.0 opencv-python pytorch-lightning omegaconf kornia
-
-echo "Installing server dependencies..."
-pip install fastapi uvicorn[standard] python-multipart
+echo "Installing ML + server dependencies..."
+pip install \
+    "transformers>=5.0" \
+    huggingface_hub \
+    scipy \
+    pillow \
+    fastapi \
+    "uvicorn[standard]" \
+    python-multipart
 
 echo "Logging in to HuggingFace..."
 if [ -z "$HF_TOKEN" ]; then
@@ -48,12 +29,9 @@ python -c "from huggingface_hub import login; import os; login(token=os.environ[
 echo ""
 echo "=== Setup complete ==="
 echo ""
-echo "Start the web server:"
-echo "  conda activate sam3"
+echo "Start the server:"
 echo "  python server.py                  # http://0.0.0.0:8000"
-echo "  python server.py --port 7860      # custom port"
+echo "  python server.py --port 8080      # custom port"
 echo ""
-echo "On Vast.AI — expose port 8000 in the instance settings,"
-echo "then visit:  http://<vast-ip>:8000/"
-echo ""
-echo "The first inference will download the SAM3 model (~6.9GB)."
+echo "On Vast.AI — expose port 8000, then visit:  http://<vast-ip>:8000/"
+echo "The first inference downloads SAM3 (~6.9GB)."

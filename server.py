@@ -230,9 +230,9 @@ _HTML = """<!DOCTYPE html>
       <input type="checkbox" id="inp-harmonize" checked
              style="width:16px;height:16px;accent-color:#7c3aed;cursor:pointer;"/>
       <label for="inp-harmonize" style="font-size:0.85rem;color:#e2e8f0;cursor:pointer;">
-        PCTNet Harmonization
+        Color Harmonization
         <span style="color:#64748b;font-size:0.78rem;margin-left:0.3rem;">
-          — adjusts person lighting &amp; colors to match background
+          — Reinhard Lab transfer: matches person tone &amp; lighting to background
         </span>
       </label>
     </div>
@@ -306,7 +306,7 @@ _HTML = """<!DOCTYPE html>
     if (!files.portrait || !files.background) return;
     setLoading(true);
     const useHarm = document.getElementById('inp-harmonize').checked;
-    setStatus(useHarm ? 'Running SAM3 + PCTNet harmonization…' : 'Running SAM3 segmentation…', 'info');
+    setStatus(useHarm ? 'Running SAM3 + color harmonization…' : 'Running SAM3 segmentation…', 'info');
     document.getElementById('result-card').style.display = 'none';
 
     const form = new FormData();
